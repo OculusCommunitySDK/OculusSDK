@@ -5,7 +5,7 @@ Content     :   OSX implementation of Gamepad functionality.
 Created     :   May 6, 2013
 Authors     :   Lee Cooper
 
-Copyright   :   Copyright 2013 Oculus VR, Inc. All Rights reserved.
+Copyright   :   Copyright 2012 Oculus VR, Inc. All Rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,13 +25,13 @@ limitations under the License.
 
 
 static const UInt32 Logitech_F710_VendorID = 0x046D;
-static const UInt32 Logitech_F710_ProductID = 0xC219;
+//static const UInt32 Logitech_F710_ProductID = 0xC219;
 
 static const UInt32 Sony_DualShock3_VendorID = 0x054C;
-static const UInt32 Sony_DualShock3_ProductID = 0x0268;
+//static const UInt32 Sony_DualShock3_ProductID = 0x0268;
 
 
-namespace OVR { namespace Platform { namespace OSX {
+namespace OVR { namespace OvrPlatform { namespace OSX {
 
     
 GamepadManager::GamepadManager()
@@ -141,6 +141,8 @@ int GamepadManager::getIntDeviceProperty(IOHIDDeviceRef device, CFStringRef key)
 
 void GamepadManager::staticOnDeviceMatched(void* context, IOReturn result, void* sender, IOHIDDeviceRef device)
 {
+    OVR_UNUSED(result);
+    OVR_UNUSED(sender);
     GamepadManager* pManager = (GamepadManager*) context;
     pManager->onDeviceMatched(device);
 }
@@ -152,6 +154,8 @@ void GamepadManager::onDeviceMatched(IOHIDDeviceRef device)
 
 void GamepadManager::staticOnDeviceRemoved(void* context, IOReturn result, void* sender, IOHIDDeviceRef device)
 {
+    OVR_UNUSED(result);
+    OVR_UNUSED(sender);
     GamepadManager* pManager = (GamepadManager*) context;
     pManager->onDeviceRemoved(device);
 }
@@ -163,6 +167,8 @@ void GamepadManager::onDeviceRemoved(IOHIDDeviceRef device)
 
 void GamepadManager::staticOnDeviceValueChanged(void* context, IOReturn result, void* sender, IOHIDValueRef value)
 {
+    OVR_UNUSED(result);
+    OVR_UNUSED(sender);
     GamepadManager* pManager = (GamepadManager*) context;
     pManager->onDeviceValueChanged(value);
 }
@@ -202,8 +208,8 @@ void GamepadManager::onDeviceValueChanged(IOHIDValueRef value)
     IOHIDElementRef element = IOHIDValueGetElement(value);
     IOHIDDeviceRef device = IOHIDElementGetDevice(element);
 
-    int vendorID = getIntDeviceProperty(device, CFSTR(kIOHIDVendorIDKey));
-    int productID = getIntDeviceProperty(device, CFSTR(kIOHIDProductIDKey));
+    unsigned int vendorID = (unsigned int)getIntDeviceProperty(device, CFSTR(kIOHIDVendorIDKey));
+    unsigned int productID = (unsigned int)getIntDeviceProperty(device, CFSTR(kIOHIDProductIDKey));
     OVR_UNUSED(productID);
     
     uint32_t usagePage = IOHIDElementGetUsagePage(element);
@@ -421,4 +427,4 @@ void GamepadManager::manipulateBitField(unsigned int& bitfield, unsigned int mas
     }
 }
 
-}}} // OVR::Platform::OSX
+}}} // OVR::OvrPlatform::OSX

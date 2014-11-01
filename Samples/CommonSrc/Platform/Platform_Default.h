@@ -5,7 +5,7 @@ Content     :   Default Platform class and RenderDevice selection file
 Created     :   October 4, 2012
 Authors     :   
 
-Copyright   :   Copyright 2012 Oculus VR, Inc. All Rights reserved.
+Copyright   :   Copyright 2012 Oculus VR, LLC All Rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,17 +29,18 @@ limitations under the License.
 
 #if defined(OVR_OS_WIN32)
   #include "Win32_Platform.h"
-
+  
   #include "../Render/Render_D3D11_Device.h"
   #undef OVR_D3D_VERSION  
   #include "../Render/Render_D3D10_Device.h"
-//  #include "../Render/Render_GL_Win32_Device.h"
+  #include "../Render/Render_GL_Win32_Device.h"
 
 // Modify this list or pass a smaller set to select a specific render device,
 // while avoiding linking extra classes.
-  #define OVR_DEFAULT_RENDER_DEVICE_SET                                                    \
-        SetupGraphicsDeviceSet("D3D11", &OVR::Render::D3D11::RenderDevice::CreateDevice,       \
-        SetupGraphicsDeviceSet("D3D10", &OVR::Render::D3D10::RenderDevice::CreateDevice) )
+  #define OVR_DEFAULT_RENDER_DEVICE_SET															\
+		SetupGraphicsDeviceSet("D3D11", &OVR::Render::D3D11::RenderDevice::CreateDevice,		\
+        SetupGraphicsDeviceSet("D3D10", &OVR::Render::D3D10::RenderDevice::CreateDevice,		\
+        SetupGraphicsDeviceSet("GL", &OVR::Render::GL::Win32::RenderDevice::CreateDevice)))
 
 #elif defined(OVR_OS_MAC) && !defined(OVR_MAC_X11)
   #include "OSX_Platform.h"

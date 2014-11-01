@@ -5,7 +5,7 @@ Content     :   Platform renderer for simple scene graph
 Created     :   September 6, 2012
 Authors     :   Andrew Reisse
 
-Copyright   :   Copyright 2012 Oculus VR, Inc. All Rights reserved.
+Copyright   :   Copyright 2012 Oculus VR, LLC All Rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,24 +28,33 @@ limitations under the License.
 #include "Kernel/OVR_RefCount.h"
 #include "Kernel/OVR_String.h"
 #include "Kernel/OVR_File.h"
+#include "Kernel/OVR_Color.h"
+#include "OVR_CAPI.h"
 
-#include "Util/Util_Render_Stereo.h"
+#include "OVR_Stereo.h"
 
 namespace OVR { namespace Render {
-
-using namespace OVR::Util::Render;
 
 class RenderDevice;
 struct Font;
 
+
 //-----------------------------------------------------------------------------------
+
+enum ShaderStage
+{
+    Shader_Vertex   = 0,
+    Shader_Geometry = 1,
+    Shader_Fragment = 2,
+    Shader_Pixel    = 2,
+    Shader_Count    = 3,
+};
 
 enum PrimitiveType
 {
     Prim_Triangles,
     Prim_Lines,
     Prim_TriangleStrip,
-    Prim_Points,
     Prim_Unknown,
     Prim_Count
 };
@@ -64,36 +73,35 @@ public:
     virtual void Set(PrimitiveType prim = Prim_Unknown) const = 0;
     virtual void Unset() const {}
 
-    virtual void SetTexture(int i, class Texture* tex) { OVR_UNUSED2(i,tex); }
-    virtual Texture* GetTexture(int i) { OVR_UNUSED(i); return 0; }
-};
-
-enum ShaderStage
-{
-    Shader_Vertex   = 0,
-    Shader_Geometry = 1,
-    Shader_Fragment = 2,
-    Shader_Pixel    = 2,
-    Shader_Count    = 3,
+    virtual void SetTexture(int i, class Texture* tex, ShaderStage stage = Shader_Pixel) { OVR_UNUSED3(i,tex,stage); }
+    virtual Texture* GetTexture(int i, ShaderStage stage = Shader_Pixel) { OVR_UNUSED2(i,stage); return 0; }
 };
 
 enum BuiltinShaders
 {
-    VShader_MV                      = 0,
-    VShader_MVP                     = 1,
-    VShader_PostProcess             = 2,
-    VShader_Count                   = 3,
-
-    FShader_Solid                   = 0,
-    FShader_Gouraud                 = 1,
-    FShader_Texture                 = 2,
-    FShader_AlphaTexture            = 3,
-    FShader_PostProcess             = 4,
-    FShader_PostProcessWithChromAb  = 5,
-    FShader_LitGouraud              = 6,
-    FShader_LitTexture              = 7,
-	FShader_MultiTexture            = 8,
-    FShader_Count                   = 9,
+    VShader_MV                                      = 0,
+    VShader_MVP                                     ,
+    VShader_PostProcess                             ,
+    VShader_PostProcessMesh                         ,
+    VShader_PostProcessMeshTimewarp                 ,
+    VShader_PostProcessMeshPositionalTimewarp       ,
+    VShader_PostProcessHeightmapTimewarp            ,
+    VShader_Count                                   ,
+                                                    
+    FShader_Solid                                   = 0,
+    FShader_Gouraud                                 ,
+    FShader_Texture                                 ,
+    FShader_AlphaTexture                            ,
+	FShader_AlphaBlendedTexture                     ,
+    FShader_PostProcessWithChromAb                  ,
+    FShader_LitGouraud                              ,
+    FShader_LitTexture                              ,
+	FShader_MultiTexture                            ,
+    FShader_PostProcessMeshWithChromAb              ,
+    FShader_PostProcessMeshWithChromAbTimewarp      ,
+    FShader_PostProcessMeshWithChromAbPositionalTimewarp ,
+    FShader_PostProcessHeightmapTimewarp            ,
+    FShader_Count                                   ,
 };
 
 
@@ -119,6 +127,8 @@ enum TextureFormat
 {
     Texture_RGBA            = 0x100,
     Texture_R               = 0x200,
+	Texture_A				= 0x400,
+	Texture_BGRA            = 0x800,
     Texture_DXT1            = 0x1100,
     Texture_DXT3            = 0x1200,
     Texture_DXT5            = 0x1300,
@@ -126,8 +136,10 @@ enum TextureFormat
     Texture_TypeMask        = 0xff00,
     Texture_Compressed      = 0x1000,
     Texture_SamplesMask     = 0x00ff,
-    Texture_RenderTarget    = 0x10000,
-    Texture_GenMipmaps      = 0x20000,
+	Texture_RenderTarget    = 0x10000,
+	Texture_SampleDepth		= 0x20000,
+    Texture_GenMipmaps      = 0x40000,
+    Texture_SRGB			= 0x80000,
 };
 
 enum SampleMode
@@ -145,16 +157,20 @@ enum SampleMode
     Sample_Count        =13,
 };
 
-// A vector with a dummy w component for alignment in uniform buffers (and for float colors).
-// The w component is not used in any calculations.
-
-struct Vector4f : public Vector3f
+enum MeshType
 {
-    float w;
+    Mesh_Scene,
+    Mesh_Distortion,
+    Mesh_Heightmap,
+};
 
-    Vector4f() : w(1) {}
-    Vector4f(const Vector3f& v) : Vector3f(v), w(1) {}
-    Vector4f(float r, float g, float b, float a) : Vector3f(r,g,b), w(a) {}
+struct Color4f
+{
+    float r, g, b, a;
+
+    Color4f() : r(0), g(0), b(0), a(1) {}
+    Color4f(const Vector3f& v) : r(v.x), g(v.y), b(v.z), a(1) {}
+    Color4f(float ir, float ig, float ib, float ia) : r(ir), g(ig), b(ib), a(ia) {}
 };
 
 
@@ -231,23 +247,33 @@ public:
         const float v[] = {x,y};
         return SetUniform(name, 2, v);
     }
+    bool SetUniform3f(const char* name, float x, float y, float z)
+    {
+        const float v[] = {x,y,z};
+        return SetUniform(name, 3, v);
+    }
     bool SetUniform4f(const char* name, float x, float y, float z, float w = 1)
     {
         const float v[] = {x,y,z,w};
         return SetUniform(name, 4, v);
     }
-    bool SetUniformv(const char* name, const Vector3f& v)
+    bool SetUniform4fv(const char* name, const Vector3f& v)
     {
         const float a[] = {v.x,v.y,v.z,1};
         return SetUniform(name, 4, a);
     }
-    bool SetUniform4fv(const char* name, int n, const Vector4f* v)
+    bool SetUniform4fvArray(const char* name, int n, const Color4f* v)
     {
-        return SetUniform(name, 4*n, &v[0].x);
+        return SetUniform(name, 4*n, &v[0].r);
     }
     virtual bool SetUniform4x4f(const char* name, const Matrix4f& m)
     {
         return SetUniform(name, 16, &m.M[0][0]);
+    }
+    virtual bool SetUniform3x3f(const char* name, const Matrix4f& m)
+    {
+        // float3x3 is actually stored the same way as float4x3, with the last items ignored by the code.
+        return SetUniform(name, 12, &m.M[0][0]);
     }
 };
 
@@ -265,6 +291,7 @@ class ShaderFill : public Fill
 {
     Ptr<ShaderSet> Shaders;
     Ptr<Texture>   Textures[8];
+    Ptr<Texture>   VtxTextures[8];
 
 public:
     ShaderFill(ShaderSet* sh) : Shaders(sh) {  }
@@ -272,8 +299,28 @@ public:
     void Set(PrimitiveType prim) const;
     ShaderSet* GetShaders() { return Shaders; }
 
-    virtual void SetTexture(int i, class Texture* tex) { if (i < 8) Textures[i] = tex; }
-    virtual Texture* GetTexture(int i) { if (i < 8) return Textures[i]; else return 0; }
+    virtual void SetTexture(int i, class Texture* tex, ShaderStage stage = Shader_Pixel)
+    {
+        if (i < 8)
+        {
+                 if(stage == Shader_Pixel)  Textures[i] = tex;
+            else if(stage == Shader_Vertex) VtxTextures[i] = tex;
+            else OVR_ASSERT(false);
+        }
+    }
+    virtual Texture* GetTexture(int i, ShaderStage stage = Shader_Pixel)
+    {
+        if (i < 8)
+        {
+                 if(stage == Shader_Pixel)      return Textures[i];
+            else if(stage == Shader_Vertex)     return VtxTextures[i];
+            else OVR_ASSERT(false);             return 0;
+        }
+        else
+        {
+            return 0;
+        }
+    }
 };
 
 /* Buffer for vertex or index data. Some renderers require separate buffers, so that
@@ -313,9 +360,18 @@ public:
 
     virtual void SetSampleMode(int sm) = 0;
     virtual void Set(int slot, ShaderStage stage = Shader_Fragment) const = 0;
+	
+	virtual ovrTexture Get_ovrTexture() = 0;
+
+	virtual void* GetInternalImplementation() { return NULL; };
 };
 
-
+struct RenderTarget
+{
+    Ptr<Texture>        pColorTex;
+    Ptr<Texture>        pDepthTex;
+    Sizei               Size;
+};
 
 //-----------------------------------------------------------------------------------
 
@@ -379,7 +435,7 @@ public:
     {
         if (!MatCurrent)
         {
-            Mat = Rot;
+            Mat = Matrix4f(Rot);
             Mat = Matrix4f::Translation(Pos) * Mat;
             MatCurrent = 1;
         }
@@ -399,7 +455,7 @@ struct Vertex
 
     Vertex (const Vector3f& p, const Color& c = Color(64,0,0,255), 
             float u = 0, float v = 0, Vector3f n = Vector3f(1,0,0))
-      : Pos(p), C(c), U(u), V(v), Norm(n), U2(u), V2(v) {}
+      : Pos(p), C(c), U(u), V(v), U2(u), V2(v), Norm(n) {}
     Vertex(float x, float y, float z, const Color& c = Color(64,0,0,255),
            float u = 0, float v = 0) : Pos(x,y,z), C(c), U(u), V(v), U2(u), V2(v) { }
 
@@ -413,18 +469,33 @@ struct Vertex
     }
 };
 
+struct DistortionVertex
+{
+    Vector2f Pos;
+    Vector2f TexR;
+    Vector2f TexG;
+    Vector2f TexB;
+    Color Col;
+};
+
+struct HeightmapVertex
+{
+    Vector2f Pos;
+    Vector3f Tex;
+};
+
 // this is stored in a uniform buffer, don't change it without fixing all renderers
 struct LightingParams
 {
-    Vector4f Ambient;
-    Vector4f LightPos[8];
-    Vector4f LightColor[8];
+    Color4f  Ambient;
+    Color4f  LightPos[8];       // Not actually colours, but we need the extra element of padding.
+    Color4f  LightColor[8];
     float    LightCount;
     int      Version;
 
     LightingParams() : LightCount(0), Version(0) {}
 
-    void Update(const Matrix4f& view, const Vector4f* SceneLightPos);
+    void Update(const Matrix4f& view, const Vector3f* SceneLightPos);
 
     void Set(ShaderSet* s) const;
 };
@@ -435,7 +506,7 @@ class Model : public Node
 {
 public:
     Array<Vertex>     Vertices;
-    Array<UInt16>     Indices;
+    Array<uint16_t>     Indices;
     PrimitiveType     Type;
     Ptr<class Fill>   Fill;
     bool              Visible;
@@ -446,7 +517,7 @@ public:
     Ptr<Buffer>       VertexBuffer;
     Ptr<Buffer>       IndexBuffer;
 
-    Model(PrimitiveType t = Prim_Triangles) : Type(t), Fill(NULL), Visible(true) { }
+    Model(PrimitiveType t = Prim_Triangles) : Type(t), Fill(NULL), Visible(true), IsCollisionModel(false) { }
     ~Model() { }
 
     virtual NodeType GetType() const { return Node_Model; }
@@ -465,40 +536,42 @@ public:
     }
 
     // Returns the index next added vertex will have.
-    UInt16 GetNextVertexIndex() const
+    uint16_t GetNextVertexIndex() const
     {
-        return (UInt16)Vertices.GetSize();
+        return (uint16_t)Vertices.GetSize();
     }
 
-    UInt16 AddVertex(const Vertex& v)
+    uint16_t AddVertex(const Vertex& v)
     {
-        assert(!VertexBuffer && !IndexBuffer);
-        UInt16 index = (UInt16)Vertices.GetSize();
-        Vertices.PushBack(v);
-        return index;
+		OVR_ASSERT(!VertexBuffer && !IndexBuffer);
+		size_t size = Vertices.GetSize();
+		OVR_ASSERT(size <= USHRT_MAX);      // We only use a short to store vert indices.
+		uint16_t index = (uint16_t) size;
+		Vertices.PushBack(v);
+		return index;
     }
-    UInt16 AddVertex(const Vector3f& v, const Color& c, float u_ = 0, float v_ = 0)
+    uint16_t AddVertex(const Vector3f& v, const Color& c, float u_ = 0, float v_ = 0)
     {
         return AddVertex(Vertex(v,c,u_,v_));
     }
-    UInt16 AddVertex(float x, float y, float z, const Color& c, float u, float v)
+    uint16_t AddVertex(float x, float y, float z, const Color& c, float u, float v)
     {
         return AddVertex(Vertex(Vector3f(x,y,z),c, u,v));
     }
 
-    void AddLine(UInt16 a, UInt16 b)
+    void AddLine(uint16_t a, uint16_t b)
     {
         Indices.PushBack(a);
         Indices.PushBack(b);
     }
 
-    UInt16 AddVertex(float x, float y, float z, const Color& c,
+    uint16_t AddVertex(float x, float y, float z, const Color& c,
                      float u, float v, float nx, float ny, float nz)
     {
         return AddVertex(Vertex(Vector3f(x,y,z),c, u,v, Vector3f(nx,ny,nz)));
     }
 
-	UInt16 AddVertex(float x, float y, float z, const Color& c,
+	uint16_t AddVertex(float x, float y, float z, const Color& c,
                      float u1, float v1, float u2, float v2, float nx, float ny, float nz)
     {
         return AddVertex(Vertex(Vector3f(x,y,z), c, u1, v1, u2, v2, Vector3f(nx,ny,nz)));
@@ -509,7 +582,7 @@ public:
         AddLine(AddVertex(a), AddVertex(b));
     }
 
-    void AddTriangle(UInt16 a, UInt16 b, UInt16 c)
+    void AddTriangle(uint16_t a, uint16_t b, uint16_t c)
     {
         Indices.PushBack(a);
         Indices.PushBack(b);
@@ -527,6 +600,9 @@ public:
                                          float y1, float y2, Color ycolor,
                                          float z1, float z2, Color zcolor);
    
+
+    // Adds box at specified location to current vertices.
+    void AddBox(Color c, Vector3f origin, Vector3f size);
 
 
     // Uses texture coordinates for exactly covering each surface once.
@@ -553,7 +629,7 @@ public:
 
     void ClearRenderer()
     {
-        for (UPInt i=0; i< Nodes.GetSize(); i++)
+        for (size_t i=0; i< Nodes.GetSize(); i++)
             Nodes[i]->ClearRenderer();
     }
 
@@ -575,18 +651,18 @@ class Scene
 {
 public:
     Container			World;
-    Vector4f			LightPos[8];
+    Vector3f			LightPos[8];
     LightingParams		Lighting;
 	Array<Ptr<Model> >	Models;
 
 public:
     void Render(RenderDevice* ren, const Matrix4f& view);
 
-    void SetAmbient(Vector4f color)
+    void SetAmbient(Color4f color)
     {
         Lighting.Ambient = color;
     }
-    void AddLight(Vector3f pos, Vector4f color)
+    void AddLight(Vector3f pos, Color4f color)
     {
         int n = (int)Lighting.LightCount;
         OVR_ASSERT(n < 8);
@@ -599,7 +675,7 @@ public:
 	{
 		World.Clear();
 		Models.Clear();
-		Lighting.Ambient = Vector4f(0.0f, 0.0f, 0.0f, 0.0f);
+		Lighting.Ambient = Color4f(0.0f, 0.0f, 0.0f, 0.0f);
 		Lighting.LightCount = 0;
 	}
 
@@ -624,11 +700,16 @@ enum RenderCaps
 };
 
 // Post-processing type to apply to scene after rendering. PostProcess_Distortion
-// applied distortion as described by DistortionConfig.
+// applied distortion as described by DistortionRenderDesc.
 enum PostProcessType
 {
     PostProcess_None,
-    PostProcess_Distortion
+    PostProcess_PixelDistortion,
+    PostProcess_MeshDistortion,
+    PostProcess_MeshDistortionTimewarp,
+    PostProcess_MeshDistortionPositionalTimewarp,
+    PostProcess_MeshDistortionHeightmapTimewarp,
+    PostProcess_NoDistortion,
 };
 
 enum DisplayMode
@@ -644,11 +725,11 @@ struct DisplayId
     String MonitorName; // Monitor name for fullscreen mode
     
     // MacOS
-    long   CgDisplayId; // CGDirectDisplayID
+    int   CgDisplayId; // CGDirectDisplayID
     
-    DisplayId() : CgDisplayId(0) {}
-    DisplayId(long id) : CgDisplayId(id) {}
-    DisplayId(String m, long id=0) : MonitorName(m), CgDisplayId(id) {}
+    DisplayId() : CgDisplayId(-2) {}
+    DisplayId(int id) : CgDisplayId(id) {}
+    DisplayId(String m, int id = -2) : MonitorName(m), CgDisplayId(id) {}
     
     operator bool () const
     {
@@ -657,19 +738,29 @@ struct DisplayId
     
     bool operator== (const DisplayId& b) const
     {
-        return CgDisplayId == b.CgDisplayId &&
-            (strstr(MonitorName.ToCStr(), b.MonitorName.ToCStr()) ||
-             strstr(b.MonitorName.ToCStr(), MonitorName.ToCStr()));
+        if (MonitorName.IsEmpty() || b.MonitorName.IsEmpty())
+        {
+            return CgDisplayId == b.CgDisplayId;
+        }
+        else
+        {
+            return  strstr(MonitorName.ToCStr(), b.MonitorName.ToCStr()) ||
+                    strstr(b.MonitorName.ToCStr(), MonitorName.ToCStr());
+        }
     }
 };
 
 struct RendererParams
 {
-    int  Multisample;
-    int  Fullscreen;
-    DisplayId Display;
+    int         Multisample;
+    bool        SrgbBackBuffer;
+    int         Fullscreen;
+    DisplayId   Display;
+    // Resolution of the rendering buffer used during creation.
+    // Allows buffer of different size then the widow if not zero.
+    Sizei       Resolution;
 
-    RendererParams(int ms = 1) : Multisample(ms), Fullscreen(0) {}
+    RendererParams(int ms = 1) : Multisample(ms), SrgbBackBuffer(false), Fullscreen(0), Resolution(0) {}
     
     bool IsDisplaySet() const
     {
@@ -688,28 +779,33 @@ class RenderDevice : public RefCountBase<RenderDevice>
 protected:
     int                 WindowWidth, WindowHeight;
     RendererParams      Params;
-    Viewport            VP;
+    Recti               VP;
 
     Matrix4f            Proj;
     Ptr<Buffer>         pTextVertexBuffer;
 
-
     // For rendering with lens warping
-    PostProcessType     CurPostProcess;
-    Ptr<Texture>        pSceneColorTex;
-    int                 SceneColorTexW;
-    int                 SceneColorTexH;
+    PostProcessType     PostProcessingType;
+
     Ptr<ShaderSet>      pPostProcessShader;
+    Ptr<ShaderSet>      pPostProcessHeightmapShader;
     Ptr<Buffer>         pFullScreenVertexBuffer;
-    float               SceneRenderScale;
-    DistortionConfig    Distortion;
     Color               DistortionClearColor;
-    UPInt			    TotalTextureMemoryUsage;
+    size_t		        TotalTextureMemoryUsage;
+    float               FadeOutBorderFraction;
+    
+    int                 DistortionMeshNumTris[2];
+    Ptr<Buffer>         pDistortionMeshVertexBuffer[2];
+    Ptr<Buffer>         pDistortionMeshIndexBuffer[2];
+
+    int                 HeightmapMeshNumTris[2];
+    Ptr<Buffer>         pHeightmapMeshVertexBuffer[2];
+    Ptr<Buffer>         pHeightmapMeshIndexBuffer[2];
 
     // For lighting on platforms with uniform buffers
     Ptr<Buffer>         LightingBuffer;
 
-    void FinishScene1();
+    RenderTarget        HeightmapTimewarpRTs[2];  // one for each eye
 
 public:
     enum CompareFunc
@@ -728,41 +824,47 @@ public:
 
 
     virtual void Init() {}
-    virtual void Shutdown() {}
-    virtual bool SetParams(const RendererParams&) { return 0; }
+    virtual void Shutdown();
+    virtual bool SetParams(const RendererParams& rp)
+    {
+        Params = rp;
+        return true;
+    }
 
     const RendererParams& GetParams() const { return Params; }
 
-    
+	// Returns details needed by CAPI distortion rendering.
+	virtual ovrRenderAPIConfig Get_ovrRenderAPIConfig() const = 0;
+
     // StereoParams apply Viewport, Projection and Distortion simultaneously,
     // doing full configuration for one eye.
     void        ApplyStereoParams(const StereoEyeParams& params)
     {
-        SetViewport(params.VP);
-        SetProjection(params.Projection);
-        if (params.pDistortion)
-            SetDistortionConfig(*params.pDistortion, params.Eye);
+        SetViewport(params.RenderedViewport);
+        SetProjection(params.RenderedProjection);
     }
 
-    // Apply "orthographic" stereo parameters used for rendering 2D HUD overlays.
-    void        ApplyStereoParams2D(const StereoEyeParams& params)
+    void        ApplyStereoParams(const Recti& vp, const Matrix4f& projection)
     {
-        SetViewport(params.VP);
-        SetProjection(params.OrthoProjection);
-        if (params.pDistortion)
-            SetDistortionConfig(*params.pDistortion, params.Eye);
+        SetViewport(vp);
+        SetProjection(projection);
+    }
+    // Apply "orthographic" stereo parameters used for rendering 2D HUD overlays.
+    void        ApplyStereoParams2D(StereoEyeParams const &params, Matrix4f const &ortho)
+    {
+        SetViewport(params.RenderedViewport);
+        SetProjection(ortho);
     }
 
+    
 
-    virtual void SetViewport(const Viewport& vp);
-    void         SetViewport(int x, int y, int w, int h) { SetViewport(Viewport(x,y,w,h)); }
-    //virtual void SetScissor(int x, int y, int w, int h) = 0;
 
-    // Set viewport ignoring any adjustments used for the stereo mode.
-    virtual void SetRealViewport(const Viewport& vp) { SetMultipleViewports(1, &vp); }
-    virtual void SetMultipleViewports(int n, const Viewport* vps) { OVR_UNUSED2(n, vps); }
+    virtual void SetViewport(const Recti& vp) = 0;
+    void         SetViewport(int x, int y, int w, int h) { SetViewport(Recti(x,y,w,h)); }
 
-    virtual void Clear(float r = 0, float g = 0, float b = 0, float a = 1, float depth = 1) = 0;
+    virtual void Clear(float r = 0, float g = 0, float b = 0, float a = 1,
+                       float depth = 1,
+                       bool clearColor = true, bool clearDepth = true) = 0;
     virtual void Rect(float left, float top, float right, float bottom) = 0;
 
     inline void Clear(const Color &c, float depth = 1)
@@ -773,9 +875,10 @@ public:
     }
 
     virtual bool IsFullscreen() const { return Params.Fullscreen != Display_Window; }
-    virtual void Present() = 0;
+    virtual void Present ( bool withVsync ) = 0;
     // Waits for rendering to complete; important for reducing latency.
-    virtual void ForceFlushGPU() { }
+    virtual void WaitUntilGpuIdle() { }
+    virtual void Flush() = 0;
 
     // Resources
     virtual Buffer*  CreateBuffer() { return NULL; }
@@ -789,18 +892,41 @@ public:
 
     // Rendering
 
+
     // Begin drawing directly to the currently selected render target, no post-processing.
     virtual void BeginRendering() {}
-    // Begin drawing the primary scene. This will have post-processing applied (if enabled)
-    // during FinishScene.
-    virtual void BeginScene(PostProcessType pp = PostProcess_None); //StereoDisplay disp = Stereo_Center);
-    // Postprocess the scene and return to the screen render target.
+    // Begin drawing the primary scene, starting up whatever post-processing may be needed.
+    virtual void BeginScene(PostProcessType pp = PostProcess_None);
+    // Call when any of the stereo options change, so precalculation can happen.
+    virtual void PrecalculatePostProcess(PostProcessType pptype,
+                                         const StereoEyeParams &stereoParamsLeft, const StereoEyeParams &stereoParamsRight,
+                                         const HmdRenderInfo &hmdRenderInfo );
+    // Perform postprocessing
+    virtual void ApplyPostProcess(Matrix4f const &matNowFromWorldStart,   Matrix4f const &matNowFromWorldEnd,
+                                  Matrix4f const &matRenderFromWorldLeft, Matrix4f const &matRenderFromWorldRight,
+                                  StereoEyeParams const &stereoParamsLeft, StereoEyeParams const &stereoParamsRight,
+                                  RenderTarget* pHmdSpaceLayerRenderTargetLeftOrBothEyes,
+                                  RenderTarget* pHmdSpaceLayerRenderTargetRight,
+                                  RenderTarget* pStaticLayerRenderTargetLeftOrBothEyes,
+                                  RenderTarget* pStaticLayerRenderTargetRight,
+                                  RenderTarget* pOutputTarget);
+
+    // Finish scene.
     virtual void FinishScene();
+
+    virtual void ResolveMsaa(Texture* msaaTex, Texture* outputTex)
+    { OVR_UNUSED2(msaaTex, outputTex); };
 
     // Texture must have been created with Texture_RenderTarget. Use NULL for the default render target.
     // NULL depth buffer means use an internal, temporary one.
     virtual void SetRenderTarget(Texture* color, Texture* depth = NULL, Texture* stencil = NULL)
     { OVR_UNUSED3(color, depth, stencil); }
+    void SetRenderTarget(const RenderTarget& renderTarget)
+    {
+        SetRenderTarget(renderTarget.pColorTex, renderTarget.pDepthTex);
+    }
+    // go to back buffer
+    void SetDefaultRenderTarget() { SetRenderTarget(NULL, NULL); }
     virtual void SetDepthMode(bool enable, bool write, CompareFunc func = Compare_Less) = 0;
     virtual void SetProjection(const Matrix4f& proj);
     virtual void SetWorldUniforms(const Matrix4f& proj) = 0;
@@ -818,30 +944,24 @@ public:
     virtual void Render(const Matrix4f& matrix, Model* model) = 0;
     // offset is in bytes; indices can be null.
     virtual void Render(const Fill* fill, Buffer* vertices, Buffer* indices,
-                        const Matrix4f& matrix, int offset, int count, PrimitiveType prim = Prim_Triangles) = 0;
+                        const Matrix4f& matrix, int offset, int count, PrimitiveType prim = Prim_Triangles, MeshType meshType = Mesh_Scene) = 0;
     virtual void RenderWithAlpha(const Fill* fill, Render::Buffer* vertices, Render::Buffer* indices,
                         const Matrix4f& matrix, int offset, int count, PrimitiveType prim = Prim_Triangles) = 0;
 
     // Returns width of text in same units as drawing. If strsize is not null, stores width and height.
-    float        MeasureText(const Font* font, const char* str, float size, float* strsize = NULL);
-    virtual void RenderText(const Font* font, const char* str, float x, float y, float size, Color c);
+    // Can optionally return char-range selection rectangle.
+    static float MeasureText(const Font* font, const char* str, float size, float strsize[2] = NULL,
+                             const size_t charRange[2] = 0, Vector2f charRangeRect[2] = 0);
+    virtual void RenderText(const Font* font, const char* str, float x, float y, float size, Color c, const Matrix4f* view = NULL);
 
-    virtual void FillRect(float left, float top, float right, float bottom, Color c);
-    virtual void FillGradientRect(float left, float top, float right, float bottom, Color col_top, Color col_btm);
-    virtual void RenderImage(float left, float top, float right, float bottom, ShaderFill* image, unsigned char alpha=255);
+    virtual void FillRect(float left, float top, float right, float bottom, Color c, const Matrix4f* view = NULL);
+    virtual void RenderLines ( int NumLines, Color c, float *x, float *y, float *z = NULL );
+    virtual void FillTexturedRect(float left, float top, float right, float bottom, float ul, float vt, float ur, float vb, Color c, Ptr<Texture> tex);
+    virtual void FillGradientRect(float left, float top, float right, float bottom, Color col_top, Color col_btm, const Matrix4f* view);
+    virtual void RenderImage(float left, float top, float right, float bottom, ShaderFill* image, unsigned char alpha=255, const Matrix4f* view = NULL);
 
     virtual Fill *CreateSimpleFill(int flags = Fill::F_Solid) = 0;
     Fill *        CreateTextureFill(Texture* tex, bool useAlpha = false);
-
-    // PostProcess distortion
-    void          SetSceneRenderScale(float ss);
-
-    void          SetDistortionConfig(const DistortionConfig& config, StereoEye eye = StereoEye_Left)
-    {
-        Distortion = config;
-        if (eye == StereoEye_Right)
-            Distortion.XCenterOffset = -Distortion.XCenterOffset;
-    }
 
     // Sets the color that is applied around distortion.
     void          SetDistortionClearColor(Color clearColor)
@@ -850,18 +970,30 @@ public:
     }
 
     // Don't call these directly, use App/Platform instead
-    virtual bool SetFullscreen(DisplayMode fullscreen) { OVR_UNUSED(fullscreen); return false; }
-    virtual void SetWindowSize(int w, int h) { WindowWidth = w; WindowHeight = h; }
+    virtual bool SetFullscreen(DisplayMode fullscreen)
+    {
+        Params.Fullscreen = fullscreen;
+        return true;
+    }
+    virtual void SetWindowSize(int w, int h)
+	{
+		WindowWidth = w;
+		WindowHeight = h;	
+		VP = Recti( 0, 0, WindowWidth, WindowHeight );
+	}
 
-    UPInt GetTotalTextureMemoryUsage() const
+    size_t GetTotalTextureMemoryUsage() const
     {
         return TotalTextureMemoryUsage;
     }
 
     enum PostProcessShader
     {
-        PostProcessShader_Distortion                = 0,
-        PostProcessShader_DistortionAndChromAb      = 1,
+        PostProcessShader_DistortionAndChromAb              = 0,
+        PostProcessShader_MeshDistortionAndChromAb,
+        PostProcessShader_MeshDistortionAndChromAbTimewarp,
+        PostProcessShader_MeshDistortionAndChromAbPositionalTimewarp,
+        PostProcessShader_MeshDistortionAndChromAbHeightmapTimewarp,
         PostProcessShader_Count
     };
 
@@ -875,6 +1007,16 @@ public:
         PostProcessShaderRequested = newShader;
     }
 
+    void SetFadeOutBorderFraction ( float newVal )
+    {
+        FadeOutBorderFraction = newVal;
+    }
+
+    // GPU Profiling
+    // using (void) to avoid "unused param" warnings
+    virtual void BeginGpuEvent(const char* markerText, uint32_t markerColor) { (void)markerText; (void)markerColor; }
+    virtual void EndGpuEvent() { }
+
 protected:
     // Stereo & post-processing
     virtual bool  initPostProcessSupport(PostProcessType pptype);
@@ -887,16 +1029,45 @@ private:
     PostProcessShader   PostProcessShaderActive;
 };
 
+//-----------------------------------------------------------------------------------
+// GPU profile marker helper to encapsulate a given scope block
+class AutoGpuProf
+{
+public:
+    AutoGpuProf(RenderDevice* device, const char* markerText, uint32_t color)
+        : mDevice(device)
+    { device->BeginGpuEvent(markerText, color); }
+
+    // Generates random color if one is not provided
+    AutoGpuProf(RenderDevice* device, const char* markerText)
+        : mDevice(device)
+    { 
+        uint32_t color =  ((rand() & 0xFF) << 24) +
+                        ((rand() & 0xFF) << 16) +
+                        ((rand() & 0xFF) <<  8) +
+                         (rand() & 0xFF);
+        device->BeginGpuEvent(markerText, color);
+    }
+
+    ~AutoGpuProf() { mDevice->EndGpuEvent(); }
+         
+private:
+    RenderDevice* mDevice;
+    AutoGpuProf() { };
+};
+//-----------------------------------------------------------------------------------
+
 int GetNumMipLevels(int w, int h);
 int GetTextureSize(int format, int w, int h);
 
 // Filter an rgba image with a 2x2 box filter, for mipmaps.
 // Image size must be a power of 2.
-void FilterRgba2x2(const UByte* src, int w, int h, UByte* dest);
+void FilterRgba2x2(const uint8_t* src, int w, int h, uint8_t* dest);
 
 Texture* LoadTextureTga(RenderDevice* ren, File* f, unsigned char alpha = 255);
 Texture* LoadTextureDDS(RenderDevice* ren, File* f);
 
-}}
+
+}} // namespace OVR::Render
 
 #endif

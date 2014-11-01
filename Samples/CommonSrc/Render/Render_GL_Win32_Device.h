@@ -3,9 +3,9 @@
 Filename    :   Render_GL_Win32 Device.h
 Content     :   Win32 OpenGL Device implementation header
 Created     :   September 10, 2012
-Authors     :   Andrew Reisse, Michael Antonov
+Authors     :   Andrew Reisse, Michael Antonov, David Borel
 
-Copyright   :   Copyright 2012 Oculus VR, Inc. All Rights reserved.
+Copyright   :   Copyright 2012 Oculus VR, LLC All Rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,7 +26,10 @@ limitations under the License.
 
 #include "Render_GL_Device.h"
 
-#ifdef WIN32
+#ifdef OVR_OS_WIN32
+#include <WinSock2.h>
+#include <WS2tcpip.h>
+#define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #endif
 
@@ -38,19 +41,28 @@ namespace OVR { namespace Render { namespace GL { namespace Win32 {
 // Win32-Specific GL Render Device, used to create OpenGL under Windows.
 class RenderDevice : public GL::RenderDevice
 {
-    HWND   Window;
-    HGLRC  WglContext;
-    HDC    GdiDc;
+    friend BOOL CALLBACK MonitorEnumFunc(HMONITOR hMonitor, HDC, LPRECT, LPARAM dwData);
+
+    HWND Window;
+    HGLRC WglContext;
+    Recti PreFullscreen;
+    Recti FSDesktop;
+    HMONITOR HMonitor;
 
 public:
-    RenderDevice(const Render::RendererParams& p, HWND win, HDC dc, HGLRC gl)
-        : GL::RenderDevice(p), Window(win), WglContext(gl), GdiDc(dc) { OVR_UNUSED(p); }
+    RenderDevice(const Render::RendererParams& p, HWND win, HGLRC gl);
+    virtual ~RenderDevice() { Shutdown(); }
 
     // Implement static initializer function to create this class.
     static Render::RenderDevice* CreateDevice(const RendererParams& rp, void* oswnd);
+	
+	virtual ovrRenderAPIConfig Get_ovrRenderAPIConfig() const;
 
     virtual void Shutdown();
-    virtual void Present();
+    virtual void Present(bool withVsync);
+	bool SetParams(const RendererParams& newParams);
+
+    virtual bool SetFullscreen(DisplayMode fullscreen);
 };
 
 

@@ -5,11 +5,19 @@ Content     :   An Apple OSX audio handler.
 Created     :   March 5, 2013
 Authors     :   Robotic Arm Software - Peter Hoff, Dan Goodman, Bryan Croteau
 
-Copyright   :   Copyright 2013 Oculus VR, Inc. All Rights reserved.
+Copyright   :   Copyright 2012 Oculus VR, Inc. All Rights reserved.
 
-Use of this software is subject to the terms of the Oculus LLC license
-agreement provided at the time of installation or download, or which
-otherwise accompanies this software in either electronic or hard copy form.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 
 ************************************************************************************/
 
@@ -24,7 +32,7 @@ otherwise accompanies this software in either electronic or hard copy form.
 
 #define AUDIO_BUFFERS 4
 
-namespace OVR { namespace Platform { namespace OSX {
+namespace OVR { namespace OvrPlatform { namespace OSX {
 
 typedef struct AQCallbackStruct
 {

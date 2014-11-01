@@ -5,7 +5,7 @@ Content     :   RenderDevice implementation  for D3DX10/11.
 Created     :   September 10, 2012
 Authors     :   Andrew Reisse
 
-Copyright   :   Copyright 2012 Oculus VR, Inc. All Rights reserved.
+Copyright   :   Copyright 2012 Oculus VR, LLC All Rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,12 +21,23 @@ limitations under the License.
 
 ************************************************************************************/
 
+#define GPU_PROFILING 0
+
 #include "Kernel/OVR_Log.h"
 #include "Kernel/OVR_Std.h"
 
+#define WIN32_LEAN_AND_MEAN
+#include <comdef.h>
+
 #include "Render_D3D1X_Device.h"
+#include "Util/Util_ImageWindow.h"
+#include "Kernel/OVR_Log.h"
+
+#include "OVR_CAPI_D3D.h"
 
 #include <d3dcompiler.h>
+
+#include <d3d9.h>   // for GPU markers
 
 #if (OVR_D3D_VERSION == 10)
 namespace OVR { namespace Render { namespace D3D10 {
@@ -43,7 +54,7 @@ static D3D1x_(INPUT_ELEMENT_DESC) ModelVertexDesc[] =
     {"Normal",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offsetof(Vertex, Norm),  D3D1x_(INPUT_PER_VERTEX_DATA), 0},
 };
 
-
+#pragma region Geometry shaders
 static const char* StdVertexShaderSrc =
     "float4x4 Proj;\n"
     "float4x4 View;\n"
@@ -89,7 +100,10 @@ static const char* SolidPixelShaderSrc =
     "};\n"
     "float4 main(in Varyings ov) : SV_Target\n"
     "{\n"
-    "   return Color;\n"
+    "   float4 finalColor = ov.Color;"
+    // blend state expects premultiplied alpha
+	"	finalColor.rgb *= finalColor.a;\n"
+    "   return finalColor;\n"
     "}\n";
 
 static const char* GouraudPixelShaderSrc =
@@ -101,7 +115,10 @@ static const char* GouraudPixelShaderSrc =
     "};\n"
     "float4 main(in Varyings ov) : SV_Target\n"
     "{\n"
-    "   return ov.Color;\n"
+    "   float4 finalColor = ov.Color;"
+    // blend state expects premultiplied alpha
+	"	finalColor.rgb *= finalColor.a;\n"
+    "   return finalColor;\n"
     "}\n";
 
 static const char* TexturePixelShaderSrc =
@@ -135,13 +152,13 @@ static const char* MultiTexturePixelShaderSrc =
     "{\n"
     "float4 color1;\n"
     "float4 color2;\n"
-    "	color1 = Texture[0].Sample(Linear, ov.TexCoord);\n"
+	"	color1 = Texture[0].Sample(Linear, ov.TexCoord);\n"
     "	color2 = Texture[1].Sample(Linear, ov.TexCoord1);\n"
-    "	color2.rgb = color2.rgb * lerp(1.2, 1.9, saturate(length(color2.rgb)));\n"
+    "	color2.rgb = color2.rgb * lerp(1.9, 1.2, saturate(length(color2.rgb)));\n"
     "	color2 = color1 * color2;\n"
     "   if (color2.a <= 0.4)\n"
     "		discard;\n"
-    "	return color2;\n"
+	"	return float4(color2.rgb / color2.a, 1);\n"
     "}\n";
 
 #define LIGHTING_COMMON                 \
@@ -201,147 +218,619 @@ static const char* AlphaTexturePixelShaderSrc =
     "};\n"
     "float4 main(in Varyings ov) : SV_Target\n"
     "{\n"
-    "   return ov.Color * float4(1,1,1,Texture.Sample(Linear, ov.TexCoord).r);\n"
+	"	float4 finalColor = ov.Color;\n"
+    "	finalColor.a *= Texture.Sample(Linear, ov.TexCoord).r;\n"
+    // blend state expects premultiplied alpha
+	"	finalColor.rgb *= finalColor.a;\n"
+	"	return finalColor;\n"
     "}\n";
 
+static const char* AlphaBlendedTexturePixelShaderSrc =
+	"Texture2D Texture : register(t0);\n"
+	"SamplerState Linear : register(s0);\n"
+	"struct Varyings\n"
+	"{\n"
+	"   float4 Position : SV_Position;\n"
+	"   float4 Color    : COLOR0;\n"
+	"   float2 TexCoord : TEXCOORD0;\n"
+	"};\n"
+	"float4 main(in Varyings ov) : SV_Target\n"
+	"{\n"
+	"	float4 finalColor = ov.Color;\n"
+	"	finalColor *= Texture.Sample(Linear, ov.TexCoord);\n"
+	// blend state expects premultiplied alpha
+	"	finalColor.rgb *= finalColor.a;\n"
+	"	return finalColor;\n"
+	"}\n";
+#pragma endregion
 
+#pragma region Distortion shaders
 // ***** PostProcess Shader
 
 static const char* PostProcessVertexShaderSrc =
     "float4x4 View : register(c4);\n"
     "float4x4 Texm : register(c8);\n"
     "void main(in float4 Position : POSITION, in float4 Color : COLOR0, in float2 TexCoord : TEXCOORD0, in float2 TexCoord1 : TEXCOORD1,\n"
-    "          out float4 oPosition : SV_Position, out float4 oColor : COLOR, out float2 oTexCoord : TEXCOORD0)\n"
+    "          out float4 oPosition : SV_Position, out float2 oTexCoord : TEXCOORD0)\n"
     "{\n"
     "   oPosition = mul(View, Position);\n"
     "   oTexCoord = mul(Texm, float4(TexCoord,0,1));\n"
-    "   oColor = Color;\n"
     "}\n";
 
-// Shader with just lens distortion correction.
-static const char* PostProcessPixelShaderSrc =
-    "Texture2D Texture : register(t0);\n"
-    "SamplerState Linear : register(s0);\n"
-    "float2 LensCenter;\n"
-    "float2 ScreenCenter;\n"
-    "float2 Scale;\n"
-    "float2 ScaleIn;\n"
-    "float4 HmdWarpParam;\n"
-    "\n"
-
-    // Scales input texture coordinates for distortion.
-    // ScaleIn maps texture coordinates to Scales to ([-1, 1]), although top/bottom will be
-    // larger due to aspect ratio.
-    "float2 HmdWarp(float2 in01)\n"
-    "{\n"
-    "   float2 theta = (in01 - LensCenter) * ScaleIn;\n" // Scales to [-1, 1]
-    "   float  rSq = theta.x * theta.x + theta.y * theta.y;\n"
-    "   float2 theta1 = theta * (HmdWarpParam.x + HmdWarpParam.y * rSq + "
-    "                   HmdWarpParam.z * rSq * rSq + HmdWarpParam.w * rSq * rSq * rSq);\n"
-    "   return LensCenter + Scale * theta1;\n"
-    "}\n"
-
-    "float4 main(in float4 oPosition : SV_Position, in float4 oColor : COLOR,\n"
-    " in float2 oTexCoord : TEXCOORD0) : SV_Target\n"
-    "{\n"
-    "   float2 tc = HmdWarp(oTexCoord);\n"
-    "   if (any(clamp(tc, ScreenCenter-float2(0.25,0.5), ScreenCenter+float2(0.25, 0.5)) - tc))\n"
-    "       return 0;\n"
-    "   return Texture.Sample(Linear, tc);\n"
-    "}\n";
 
 // Shader with lens distortion and chromatic aberration correction.
 static const char* PostProcessPixelShaderWithChromAbSrc =
     "Texture2D Texture : register(t0);\n"
     "SamplerState Linear : register(s0);\n"
-    "float2 LensCenter;\n"
-    "float2 ScreenCenter;\n"
-    "float2 Scale;\n"
-    "float2 ScaleIn;\n"
+    "float3 DistortionClearColor;\n"
+    "float EdgeFadeScale;\n"
+    "float2 EyeToSourceUVScale;\n"
+    "float2 EyeToSourceUVOffset;\n"
+    "float2 EyeToSourceNDCScale;\n"
+    "float2 EyeToSourceNDCOffset;\n"
+    "float2 TanEyeAngleScale;\n"
+    "float2 TanEyeAngleOffset;\n"
     "float4 HmdWarpParam;\n"
     "float4 ChromAbParam;\n"
     "\n"
 
-    // Scales input texture coordinates for distortion.
-    // ScaleIn maps texture coordinates to Scales to ([-1, 1]), although top/bottom will be
-    // larger due to aspect ratio.
-    "float4 main(in float4 oPosition : SV_Position, in float4 oColor : COLOR,\n"
+    "float4 main(in float4 oPosition : SV_Position,\n"
     "            in float2 oTexCoord : TEXCOORD0) : SV_Target\n"
     "{\n"
-    "   float2 theta = (oTexCoord - LensCenter) * ScaleIn;\n" // Scales to [-1, 1]
-    "   float  rSq = theta.x * theta.x + theta.y * theta.y;\n"
-    "   float2 theta1 = theta * (HmdWarpParam.x + HmdWarpParam.y * rSq + "
-    "                   HmdWarpParam.z * rSq * rSq + HmdWarpParam.w * rSq * rSq * rSq);\n"
-    "   \n"
-    "   // Detect whether blue texture coordinates are out of range since these will scaled out the furthest.\n"
-    "   float2 thetaBlue = theta1 * (ChromAbParam.z + ChromAbParam.w * rSq);\n"
-    "   float2 tcBlue = LensCenter + Scale * thetaBlue;\n"
-    "   if (any(clamp(tcBlue, ScreenCenter-float2(0.25,0.5), ScreenCenter+float2(0.25, 0.5)) - tcBlue))\n"
-    "       return 0;\n"
-    "   \n"
-    "   // Now do blue texture lookup.\n"
-    "   float  blue = Texture.Sample(Linear, tcBlue).b;\n"
-    "   \n"
-    "   // Do green lookup (no scaling).\n"
-    "   float2 tcGreen = LensCenter + Scale * theta1;\n"
-    "   float4 greenColor = Texture.Sample(Linear, tcGreen);\n"
-    "   float  green = greenColor.g;\n"
-    "   float  alpha = greenColor.a;\n"
-    "   \n"
-    "   // Do red scale and lookup.\n"
-    "   float2 thetaRed = theta1 * (ChromAbParam.x + ChromAbParam.y * rSq);\n"
-    "   float2 tcRed = LensCenter + Scale * thetaRed;\n"
-    "   float  red = Texture.Sample(Linear, tcRed).r;\n"
-    "   \n"
-    "   return float4(red, green, blue, alpha);\n"
+    // Input oTexCoord is [-1,1] across the half of the screen used for a single eye.
+    "   float2 TanEyeAngleDistorted = oTexCoord * TanEyeAngleScale + TanEyeAngleOffset;\n" // Scales to tan(thetaX),tan(thetaY), but still distorted (i.e. only the center is correct)
+    "   float  RadiusSq = TanEyeAngleDistorted.x * TanEyeAngleDistorted.x + TanEyeAngleDistorted.y * TanEyeAngleDistorted.y;\n"
+    "   float Distort = rcp ( 1.0 + RadiusSq * ( HmdWarpParam.y + RadiusSq * ( HmdWarpParam.z + RadiusSq * ( HmdWarpParam.w ) ) ) );\n"
+    "   float DistortR = Distort * ( ChromAbParam.x + RadiusSq * ChromAbParam.y );\n"
+    "   float DistortG = Distort;\n"
+    "   float DistortB = Distort * ( ChromAbParam.z + RadiusSq * ChromAbParam.w );\n"
+    "   float2 TanEyeAngleR = DistortR * TanEyeAngleDistorted;\n"
+    "   float2 TanEyeAngleG = DistortG * TanEyeAngleDistorted;\n"
+    "   float2 TanEyeAngleB = DistortB * TanEyeAngleDistorted;\n"
+
+    // These are now in "TanEyeAngle" space.
+    // The vectors (TanEyeAngleRGB.x, TanEyeAngleRGB.y, 1.0) are real-world vectors pointing from the eye to where the components of the pixel appear to be.
+    // If you had a raytracer, you could just use them directly.
+
+    // Scale them into ([0,0.5],[0,1]) or ([0.5,0],[0,1]) UV lookup space (depending on eye)
+    "   float2 SourceCoordR = TanEyeAngleR * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+    "   float2 SourceCoordG = TanEyeAngleG * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+    "   float2 SourceCoordB = TanEyeAngleB * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+
+    // Find the distance to the nearest edge.
+    "   float2 NDCCoord = TanEyeAngleG * EyeToSourceNDCScale + EyeToSourceNDCOffset;\n"
+    "   float EdgeFadeIn = EdgeFadeScale * ( 1.0 - max ( abs ( NDCCoord.x ), abs ( NDCCoord.y ) ) );\n"
+    "   if ( EdgeFadeIn < 0.0 )\n"
+    "   {\n"
+    "       return float4(DistortionClearColor.r, DistortionClearColor.g, DistortionClearColor.b, 1.0);\n"
+    "   }\n"
+    "   EdgeFadeIn = saturate ( EdgeFadeIn );\n"
+
+    // Actually do the lookups.
+    "   float4 Result = float4(0,0,0,1);\n"
+    "   Result.r = Texture.Sample(Linear, SourceCoordR).r;\n"
+    "   Result.g = Texture.Sample(Linear, SourceCoordG).g;\n"
+    "   Result.b = Texture.Sample(Linear, SourceCoordB).b;\n"
+    "   Result.rgb *= EdgeFadeIn;\n"
+    "   return Result;\n"
+    "}\n";
+
+//----------------------------------------------------------------------------
+
+// A vertex format used for mesh-based distortion.
+/*
+struct DistortionVertex
+{
+    Vector2f Pos;
+    Vector2f TexR;
+    Vector2f TexG;
+    Vector2f TexB;
+    Color Col;
+};
+*/
+
+static D3D1x_(INPUT_ELEMENT_DESC) DistortionVertexDesc[] =
+{
+    {"Position", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 0,          D3D1x_(INPUT_PER_VERTEX_DATA), 0},
+    {"TexCoord", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 8,          D3D1x_(INPUT_PER_VERTEX_DATA), 0},
+    {"TexCoord", 1, DXGI_FORMAT_R32G32_FLOAT,       0, 8+8,	       D3D1x_(INPUT_PER_VERTEX_DATA), 0},
+    {"TexCoord", 2, DXGI_FORMAT_R32G32_FLOAT,       0, 8+8+8,	   D3D1x_(INPUT_PER_VERTEX_DATA), 0},
+    {"Color",    0, DXGI_FORMAT_R8G8B8A8_UNORM,     0, 8+8+8+8,    D3D1x_(INPUT_PER_VERTEX_DATA), 0},
+};
+
+//----------------------------------------------------------------------------
+// Simple distortion shader that does three texture reads.
+// Used for mesh-based distortion without timewarp.
+
+static const char* PostProcessMeshVertexShaderSrc =
+    "float2 EyeToSourceUVScale;\n"
+    "float2 EyeToSourceUVOffset;\n"
+    "void main(in float2 Position : POSITION, in float4 Color : COLOR0, in float2 TexCoord0 : TEXCOORD0, in float2 TexCoord1 : TEXCOORD1, in float2 TexCoord2 : TEXCOORD2,\n"
+    "          out float4 oPosition : SV_Position, out float4 oColor : COLOR, out float2 oTexCoord0 : TEXCOORD0, out float2 oTexCoord1 : TEXCOORD1, out float2 oTexCoord2 : TEXCOORD2)\n"
+    "{\n"
+    "   oPosition.x = Position.x;\n"
+    "   oPosition.y = Position.y;\n"
+    "   oPosition.z = 0.5;\n"
+    "   oPosition.w = 1.0;\n"
+    // Vertex inputs are in TanEyeAngle space for the R,G,B channels (i.e. after chromatic aberration and distortion).
+    // Scale them into the correct [0-1],[0-1] UV lookup space (depending on eye)
+    "   oTexCoord0 = TexCoord0 * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+    "   oTexCoord1 = TexCoord1 * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+    "   oTexCoord2 = TexCoord2 * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+    "   oColor = Color;\n"              // Used for vignette fade.
+    "}\n";
+    
+static const char* PostProcessMeshPixelShaderSrc =
+    "Texture2D HmdSpcTexture : register(t0);\n"
+    "Texture2D OverlayTexture : register(t1);\n"
+    "SamplerState Linear : register(s0);\n"
+    "float  UseOverlay = 1;\n"
+    "\n"
+    "float4 main(in float4 oPosition : SV_Position, in float4 oColor : COLOR,\n"
+    "            in float2 oTexCoord0 : TEXCOORD0, in float2 oTexCoord1 : TEXCOORD1, in float2 oTexCoord2 : TEXCOORD2) : SV_Target\n"
+    "{\n"
+    "   float4 finalColor = float4(0,0,0,1);\n"
+    "   finalColor.r = HmdSpcTexture.Sample(Linear, oTexCoord0).r;\n"
+    "   finalColor.g = HmdSpcTexture.Sample(Linear, oTexCoord1).g;\n"
+    "   finalColor.b = HmdSpcTexture.Sample(Linear, oTexCoord2).b;\n"
+
+    "   if(UseOverlay > 0)\n"
+    "   {\n"
+    "       float2 overlayColorR = OverlayTexture.Sample(Linear, oTexCoord0).ra;\n"
+    "       float2 overlayColorG = OverlayTexture.Sample(Linear, oTexCoord1).ga;\n"
+    "       float2 overlayColorB = OverlayTexture.Sample(Linear, oTexCoord2).ba;\n"
+
+    // do premultiplied alpha blending - overlayColorX.x is color, overlayColorX.y is alpha
+    "       finalColor.r = finalColor.r * saturate(1-overlayColorR.y) + overlayColorR.x;\n"
+    "       finalColor.g = finalColor.g * saturate(1-overlayColorG.y) + overlayColorG.x;\n"
+    "       finalColor.b = finalColor.b * saturate(1-overlayColorB.y) + overlayColorB.x;\n"
+    "   }\n"
+
+    "   finalColor.rgb = saturate(finalColor.rgb * oColor.rgb);\n"
+    "   return finalColor;\n"
     "}\n";
 
 
-static const char* VShaderSrcs[VShader_Count] =
+//----------------------------------------------------------------------------
+// Pixel shader is very simple - does three texture reads.
+// Vertex shader does all the hard work.
+// Used for mesh-based distortion with timewarp.
+
+static const char* PostProcessMeshTimewarpVertexShaderSrc =
+    "float2 EyeToSourceUVScale;\n"
+    "float2 EyeToSourceUVOffset;\n"
+    "float3x3 EyeRotationStart;\n"
+    "float3x3 EyeRotationEnd;\n"
+    "void main(in float2 Position : POSITION, in float4 Color : COLOR0,\n"
+    "          in float2 TexCoord0 : TEXCOORD0, in float2 TexCoord1 : TEXCOORD1, in float2 TexCoord2 : TEXCOORD2,\n"
+    "          out float4 oPosition : SV_Position, out float4 oColor : COLOR,\n"
+    "          out float2 oHmdSpcTexCoordR : TEXCOORD0, out float2 oHmdSpcTexCoordG : TEXCOORD1, out float2 oHmdSpcTexCoordB : TEXCOORD2,"
+    "          out float2 oOverlayTexCoordR : TEXCOORD3, out float2 oOverlayTexCoordG : TEXCOORD4, out float2 oOverlayTexCoordB : TEXCOORD5)\n"
+    "{\n"
+    "   oPosition.x = Position.x;\n"
+    "   oPosition.y = Position.y;\n"
+    "   oPosition.z = 0.5;\n"
+    "   oPosition.w = 1.0;\n"
+
+    // Vertex inputs are in TanEyeAngle space for the R,G,B channels (i.e. after chromatic aberration and distortion).
+    // These are now "real world" vectors in direction (x,y,1) relative to the eye of the HMD.
+    "   float3 TanEyeAngleR = float3 ( TexCoord0.x, TexCoord0.y, 1.0 );\n"
+    "   float3 TanEyeAngleG = float3 ( TexCoord1.x, TexCoord1.y, 1.0 );\n"
+    "   float3 TanEyeAngleB = float3 ( TexCoord2.x, TexCoord2.y, 1.0 );\n"
+
+    // Accurate time warp lerp vs. faster
+#if 1
+    // Apply the two 3x3 timewarp rotations to these vectors.
+    "   float3 TransformedRStart = mul ( TanEyeAngleR, EyeRotationStart );\n"
+    "   float3 TransformedGStart = mul ( TanEyeAngleG, EyeRotationStart );\n"
+    "   float3 TransformedBStart = mul ( TanEyeAngleB, EyeRotationStart );\n"
+    "   float3 TransformedREnd   = mul ( TanEyeAngleR, EyeRotationEnd );\n"
+    "   float3 TransformedGEnd   = mul ( TanEyeAngleG, EyeRotationEnd );\n"
+    "   float3 TransformedBEnd   = mul ( TanEyeAngleB, EyeRotationEnd );\n"
+    // And blend between them.
+    "   float3 TransformedR = lerp ( TransformedRStart, TransformedREnd, Color.a );\n"
+    "   float3 TransformedG = lerp ( TransformedGStart, TransformedGEnd, Color.a );\n"
+    "   float3 TransformedB = lerp ( TransformedBStart, TransformedBEnd, Color.a );\n"
+#else
+    "   float3x3 EyeRotation = lerp ( EyeRotationStart, EyeRotationEnd, Color.a );\n"
+    "   float3 TransformedR   = mul ( TanEyeAngleR, EyeRotation );\n"
+    "   float3 TransformedG   = mul ( TanEyeAngleG, EyeRotation );\n"
+    "   float3 TransformedB   = mul ( TanEyeAngleB, EyeRotation );\n"
+#endif
+
+    // Project them back onto the Z=1 plane of the rendered images.
+    "   float RecipZR = rcp ( TransformedR.z );\n"
+    "   float RecipZG = rcp ( TransformedG.z );\n"
+    "   float RecipZB = rcp ( TransformedB.z );\n"
+    "   float2 FlattenedR = float2 ( TransformedR.x * RecipZR, TransformedR.y * RecipZR );\n"
+    "   float2 FlattenedG = float2 ( TransformedG.x * RecipZG, TransformedG.y * RecipZG );\n"
+    "   float2 FlattenedB = float2 ( TransformedB.x * RecipZB, TransformedB.y * RecipZB );\n"
+
+    // These are now still in TanEyeAngle space.
+    // Scale them into the correct [0-1],[0-1] UV lookup space (depending on eye)
+    "   oHmdSpcTexCoordR = FlattenedR * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+    "   oHmdSpcTexCoordG = FlattenedG * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+    "   oHmdSpcTexCoordB = FlattenedB * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+
+    // Static layer texcoords don't get any time warp offset
+    "   oOverlayTexCoordR = TexCoord0 * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+    "   oOverlayTexCoordG = TexCoord1 * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+    "   oOverlayTexCoordB = TexCoord2 * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+
+    "   oColor = Color.r;\n"              // Used for vignette fade.
+    "}\n";
+    
+static const char* PostProcessMeshTimewarpPixelShaderSrc =
+    "Texture2D HmdSpcTexture : register(t0);\n"
+    "Texture2D OverlayTexture : register(t1);\n"
+    "SamplerState Linear : register(s0);\n"
+    "float  UseOverlay = 1;\n"
+    "\n"
+    "float4 main(in float4 oPosition : SV_Position, in float4 oColor : COLOR,\n"
+    "          in float2 oHmdSpcTexCoordR : TEXCOORD0, in float2 oHmdSpcTexCoordG : TEXCOORD1, in float2 oHmdSpcTexCoordB : TEXCOORD2,"
+    "          in float2 oOverlayTexCoordR : TEXCOORD3, in float2 oOverlayTexCoordG : TEXCOORD4, in float2 oOverlayTexCoordB : TEXCOORD5) : SV_Target\n"
+    "{\n"
+    "   float4 finalColor = float4(0,0,0,1);\n"
+    "   finalColor.r = HmdSpcTexture.Sample(Linear, oHmdSpcTexCoordR).r;\n"
+    "   finalColor.g = HmdSpcTexture.Sample(Linear, oHmdSpcTexCoordG).g;\n"
+    "   finalColor.b = HmdSpcTexture.Sample(Linear, oHmdSpcTexCoordB).b;\n"
+
+    "   if(UseOverlay > 0)\n"
+    "   {\n"
+    "       float2 overlayColorR = OverlayTexture.Sample(Linear, oOverlayTexCoordR).ra;\n"
+    "       float2 overlayColorG = OverlayTexture.Sample(Linear, oOverlayTexCoordG).ga;\n"
+    "       float2 overlayColorB = OverlayTexture.Sample(Linear, oOverlayTexCoordB).ba;\n"
+
+    // do premultiplied alpha blending - overlayColorX.x is color, overlayColorX.y is alpha
+    "       finalColor.r = finalColor.r * saturate(1-overlayColorR.y) + overlayColorR.x;\n"
+    "       finalColor.g = finalColor.g * saturate(1-overlayColorG.y) + overlayColorG.x;\n"
+    "       finalColor.b = finalColor.b * saturate(1-overlayColorB.y) + overlayColorB.x;\n"
+    "   }\n"
+
+    "   finalColor.rgb = saturate(finalColor.rgb * oColor.rgb);\n"
+    "   return finalColor;\n"
+    "}\n";
+
+
+//----------------------------------------------------------------------------
+// Pixel shader is very simple - does three texture reads.
+// Vertex shader does all the hard work.
+// Used for mesh-based distortion with positional timewarp.
+
+static const char* PostProcessMeshPositionalTimewarpVertexShaderSrc =
+    "Texture2DMS<float,4> DepthTexture : register(t0);\n"
+    // Padding because we are uploading "standard uniform buffer" constants
+    "float4x4 Padding1;\n"
+    "float4x4 Padding2;\n"
+    "float2 EyeToSourceUVScale;\n"
+    "float2 EyeToSourceUVOffset;\n"
+    "float2 DepthProjector;\n"
+    "float2 DepthDimSize;\n"
+    "float4x4 EyeRotationStart;\n"
+    "float4x4 EyeRotationEnd;\n"
+
+    "float4 PositionFromDepth(float2 inTexCoord)\n"
+    "{\n"
+    "   float2 eyeToSourceTexCoord = inTexCoord * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+    "   float depth = DepthTexture.Load(int2(eyeToSourceTexCoord * DepthDimSize), 0).x;\n"
+    "   float linearDepth = DepthProjector.y / (depth - DepthProjector.x);\n"
+    "   float4 retVal = float4(inTexCoord, 1, 1);\n"
+    "   retVal.xyz *= linearDepth;\n"
+    "   return retVal;\n"
+    "}\n"
+
+    "float2 TimewarpTexCoordToWarpedPos(float2 inTexCoord, float4x4 rotMat)\n"
+    "{\n"
+    // Vertex inputs are in TanEyeAngle space for the R,G,B channels (i.e. after chromatic aberration and distortion).
+    // These are now "real world" vectors in direction (x,y,1) relative to the eye of the HMD.	
+    // Apply the 4x4 timewarp rotation to these vectors.
+    "   float4 inputPos = PositionFromDepth(inTexCoord);\n"
+    "   float3 transformed = float3( mul ( rotMat, inputPos ).xyz);\n"
+    // Project them back onto the Z=1 plane of the rendered images.
+    "   float2 flattened = transformed.xy / transformed.z;\n"
+    // Scale them into ([0,0.5],[0,1]) or ([0.5,0],[0,1]) UV lookup space (depending on eye)
+    "   float2 noDepthUV = flattened * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+    //"   float depth = DepthTexture.SampleLevel(Linear, noDepthUV, 0).r;\n"
+    "   return noDepthUV.xy;\n"
+    "}\n"
+
+    "void main(in float2 Position    : POSITION,    in float4 Color       : COLOR0,    in float2 TexCoord0 : TEXCOORD0,\n"
+    "          in float2 TexCoord1   : TEXCOORD1,   in float2 TexCoord2   : TEXCOORD2,\n"
+    "          out float4 oPosition  : SV_Position, out float4 oColor     : COLOR,\n"
+    "          out float2 oHmdSpcTexCoordR : TEXCOORD0, out float2 oHmdSpcTexCoordG : TEXCOORD1, out float2 oHmdSpcTexCoordB : TEXCOORD2,"
+    "          out float2 oOverlayTexCoordR : TEXCOORD3, out float2 oOverlayTexCoordG : TEXCOORD4, out float2 oOverlayTexCoordB : TEXCOORD5)\n"
+    "{\n"
+    "   oPosition.x = Position.x;\n"
+    "   oPosition.y = Position.y;\n"
+    "   oPosition.z = 0.5;\n"
+    "   oPosition.w = 1.0;\n"
+
+    "   float timewarpLerpFactor = Color.a;\n"
+    "   float4x4 lerpedEyeRot = lerp(EyeRotationStart, EyeRotationEnd, timewarpLerpFactor);\n"
+    //"	float4x4 lerpedEyeRot = EyeRotationStart;\n"
+
+    // warped positions are a bit more involved, hence a separate function
+    "   oHmdSpcTexCoordR = TimewarpTexCoordToWarpedPos(TexCoord0, lerpedEyeRot);\n"
+    "   oHmdSpcTexCoordG = TimewarpTexCoordToWarpedPos(TexCoord1, lerpedEyeRot);\n"
+    "   oHmdSpcTexCoordB = TimewarpTexCoordToWarpedPos(TexCoord2, lerpedEyeRot);\n"
+
+    "   oOverlayTexCoordR = TexCoord0 * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+    "   oOverlayTexCoordG = TexCoord1 * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+    "   oOverlayTexCoordB = TexCoord2 * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+
+    "   oColor = Color.r;              // Used for vignette fade.\n"
+    "}\n";
+
+static const char* PostProcessMeshPositionalTimewarpPixelShaderSrc =
+    "Texture2D HmdSpcTexture : register(t0);\n"
+    "Texture2D OverlayTexture : register(t1);\n"
+    "SamplerState Linear : register(s0);\n"
+    "float2 DepthDimSize;\n"
+    "float  UseOverlay = 1;\n"
+    "\n"
+    "float4 main(in float4 oPosition : SV_Position, in float4 oColor : COLOR,\n"
+    "            in float2 oHmdSpcTexCoordR : TEXCOORD0, in float2 oHmdSpcTexCoordG : TEXCOORD1, in float2 oHmdSpcTexCoordB : TEXCOORD2,"
+    "            in float2 oOverlayTexCoordR : TEXCOORD3, in float2 oOverlayTexCoordG : TEXCOORD4, in float2 oOverlayTexCoordB : TEXCOORD5) : SV_Target\n"
+    "{\n"
+    "   float4 finalColor = float4(0,0,0,1);\n"
+    "   finalColor.r = HmdSpcTexture.Sample(Linear, oHmdSpcTexCoordR).r;\n"
+    "   finalColor.g = HmdSpcTexture.Sample(Linear, oHmdSpcTexCoordG).g;\n"
+    "   finalColor.b = HmdSpcTexture.Sample(Linear, oHmdSpcTexCoordB).b;\n"
+
+    "   if(UseOverlay > 0)\n"
+    "   {\n"
+    "       float2 overlayColorR = OverlayTexture.Sample(Linear, oOverlayTexCoordR).ra;\n"
+    "       float2 overlayColorG = OverlayTexture.Sample(Linear, oOverlayTexCoordG).ga;\n"
+    "       float2 overlayColorB = OverlayTexture.Sample(Linear, oOverlayTexCoordB).ba;\n"
+
+    // do premultiplied alpha blending - overlayColorX.x is color, overlayColorX.y is alpha
+    "       finalColor.r = finalColor.r * saturate(1-overlayColorR.y) + overlayColorR.x;\n"
+    "       finalColor.g = finalColor.g * saturate(1-overlayColorG.y) + overlayColorG.x;\n"
+    "       finalColor.b = finalColor.b * saturate(1-overlayColorB.y) + overlayColorB.x;\n"
+    "   }\n"
+
+    "   finalColor.rgb = saturate(finalColor.rgb * oColor.rgb);\n"
+    "   return finalColor;\n"
+    "}\n";
+
+//----------------------------------------------------------------------------
+// Pixel shader is very simple - does three texture reads.
+// Vertex shader does all the hard work.
+// Used for mesh-based heightmap reprojection for positional timewarp.
+
+static D3D1x_(INPUT_ELEMENT_DESC) HeightmapVertexDesc[] =
 {
-    DirectVertexShaderSrc,
-    StdVertexShaderSrc,
-    PostProcessVertexShaderSrc
-};
-static const char* FShaderSrcs[FShader_Count] =
-{
-    SolidPixelShaderSrc,
-    GouraudPixelShaderSrc,
-    TexturePixelShaderSrc,
-    AlphaTexturePixelShaderSrc,
-    PostProcessPixelShaderSrc,
-    PostProcessPixelShaderWithChromAbSrc,
-    LitSolidPixelShaderSrc,
-    LitTexturePixelShaderSrc,
-    MultiTexturePixelShaderSrc
+    {"Position", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 0,          D3D1x_(INPUT_PER_VERTEX_DATA), 0},
+    {"TexCoord", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 8,          D3D1x_(INPUT_PER_VERTEX_DATA), 0},
 };
 
-RenderDevice::RenderDevice(const RendererParams& p, HWND window)
+static const char* PostProcessHeightmapTimewarpVertexShaderSrc =
+	"Texture2DMS<float,4> DepthTexture : register(t0);\n"
+    // Padding because we are uploading "standard uniform buffer" constants
+    "float4x4 Padding1;\n"
+    "float4x4 Padding2;\n"
+    "float2 EyeToSourceUVScale;\n"
+    "float2 EyeToSourceUVOffset;\n"
+	"float2 DepthDimSize;\n"
+	"float4x4 EyeXformStart;\n"
+    "float4x4 EyeXformEnd;\n"
+    //"float4x4 Projection;\n"
+    "float4x4 InvProjection;\n"
+
+    "float4 PositionFromDepth(float2 position, float2 inTexCoord)\n"
+    "{\n"
+    "   float depth = DepthTexture.Load(int2(inTexCoord * DepthDimSize), 0).x;\n"
+	"   float4 retVal = float4(position, depth, 1);\n"
+    "   return retVal;\n"
+    "}\n"
+
+    "float4 TimewarpPos(float2 position, float2 inTexCoord, float4x4 rotMat)\n"
+    "{\n"
+    // Apply the 4x4 timewarp rotation to these vectors.
+    "   float4 transformed = PositionFromDepth(position, inTexCoord);\n"
+    // TODO: Precombining InvProjection in rotMat causes loss of precision flickering
+    "   transformed = mul ( InvProjection, transformed );\n"
+    "   transformed = mul ( rotMat, transformed );\n"
+    // Commented out as Projection is currently contained in rotMat
+    //"   transformed = mul ( Projection, transformed );\n"
+    "   return transformed;\n"
+    "}\n"
+
+    "void main( in float2 Position    : POSITION,    in float3 TexCoord0    : TEXCOORD0,\n"
+    "           out float4 oPosition  : SV_Position, out float2 oTexCoord0  : TEXCOORD0)\n"
+    "{\n"
+    "   float2 eyeToSrcTexCoord = TexCoord0.xy * EyeToSourceUVScale + EyeToSourceUVOffset;\n"
+    "   oTexCoord0 = eyeToSrcTexCoord;\n"
+
+    "   float timewarpLerpFactor = TexCoord0.z;\n"
+    "   float4x4 lerpedEyeRot = lerp(EyeXformStart, EyeXformEnd, timewarpLerpFactor);\n"
+    //"	float4x4 lerpedEyeRot = EyeXformStart;\n"
+
+    "   oPosition = TimewarpPos(Position.xy, oTexCoord0, lerpedEyeRot);\n"
+    "}\n";
+
+static const char* PostProcessHeightmapTimewarpPixelShaderSrc =
+	"Texture2D Texture : register(t0);\n"
+    "SamplerState Linear : register(s0);\n"
+	"\n"
+    "float4 main(in float4 oPosition : SV_Position, in float2 oTexCoord0 : TEXCOORD0) : SV_Target\n"
+    "{\n"
+    "   float3 result;\n"
+	"   result = Texture.Sample(Linear, oTexCoord0);\n"
+	"   return float4(result, 1.0);\n"
+    "}\n";
+
+#pragma endregion
+
+//----------------------------------------------------------------------------
+
+struct ShaderSource
 {
+    const char* ShaderModel;
+    const char* SourceStr;
+};
+
+static ShaderSource VShaderSrcs[VShader_Count] =
+{
+    {"vs_4_0", DirectVertexShaderSrc},
+    {"vs_4_0", StdVertexShaderSrc},
+    {"vs_4_0", PostProcessVertexShaderSrc},
+    {"vs_4_0", PostProcessMeshVertexShaderSrc},
+    {"vs_4_0", PostProcessMeshTimewarpVertexShaderSrc},
+    {"vs_4_1", PostProcessMeshPositionalTimewarpVertexShaderSrc},
+    {"vs_4_1", PostProcessHeightmapTimewarpVertexShaderSrc},
+};
+static ShaderSource FShaderSrcs[FShader_Count] =
+{
+    {"ps_4_0", SolidPixelShaderSrc},
+    {"ps_4_0", GouraudPixelShaderSrc},
+    {"ps_4_0", TexturePixelShaderSrc},
+	{"ps_4_0", AlphaTexturePixelShaderSrc},
+	{"ps_4_0", AlphaBlendedTexturePixelShaderSrc},
+    {"ps_4_0", PostProcessPixelShaderWithChromAbSrc},
+    {"ps_4_0", LitSolidPixelShaderSrc},
+    {"ps_4_0", LitTexturePixelShaderSrc},
+    {"ps_4_0", MultiTexturePixelShaderSrc},
+    {"ps_4_0", PostProcessMeshPixelShaderSrc},
+    {"ps_4_0", PostProcessMeshTimewarpPixelShaderSrc},
+    {"ps_4_0", PostProcessMeshPositionalTimewarpPixelShaderSrc},
+    {"ps_4_0", PostProcessHeightmapTimewarpPixelShaderSrc},
+};
+
+#ifdef OVR_BUILD_DEBUG
+
+static void ReportCOMError(HRESULT hr, const char* file, int line)
+{
+    if (FAILED(hr))
+    {
+        _com_error err(hr);
+        LPCTSTR errMsg = err.ErrorMessage();
+
+        if (sizeof(TCHAR) == sizeof(char))
+        {
+            LogError("{ERR-017w} [D3D] Error in %s on line %d : %s", file, line, errMsg);
+        }
+        else
+        {
+#ifdef _UNICODE
+            size_t len = wcslen(errMsg);
+            char* data = new char[len + 1];
+            size_t count = len;
+            wcstombs_s(&count, data, len + 1, errMsg, len);
+            if (count < len)
+            {
+                len = count;
+            }
+            data[len] = '\0';
+#else
+            const char* data = errMsg;
+#endif
+            LogError("{ERR-018w} [D3D] Error in %s on line %d : %s", file, line, data);
+#ifdef _UNICODE
+            delete[] data;
+#endif
+        }
+
+        OVR_ASSERT(false);
+    }
+}
+
+#define OVR_LOG_COM_ERROR(hr) \
+    ReportCOMError(hr, __FILE__, __LINE__);
+
+#else
+
+#define OVR_LOG_COM_ERROR(hr) ;
+
+#endif
+
+
+RenderDevice::RenderDevice(const RendererParams& p, HWND window) :
+    DXGIFactory(),
+    Window(window),
+    Device(),
+    Context(),
+    SwapChain(),
+    Adapter(),
+    FullscreenOutput(),
+    FSDesktopX(-1),
+    FSDesktopY(-1),
+    PreFullscreenX(0),
+    PreFullscreenY(0),
+    PreFullscreenW(0),
+    PreFullscreenH(0),
+    BackBuffer(),
+    BackBufferRT(),
+    CurRenderTarget(),
+    CurDepthBuffer(),
+    Rasterizer(),
+    BlendState(),
+  //DepthStates[]
+    CurDepthState(),
+    ModelVertexIL(),
+    DistortionVertexIL(),
+    HeightmapVertexIL(),
+  //SamplerStates[]
+    StdUniforms(),
+  //UniformBuffers[];
+  //MaxTextureSet[];
+  //VertexShaders[];
+  //PixelShaders[];
+  //pStereoShaders[];
+  //CommonUniforms[];
+    ExtraShaders(),
+    DefaultFill(),
+    QuadVertexBuffer(),
+    DepthBuffers()
+{
+    memset(&D3DViewport, 0, sizeof(D3DViewport));
+    memset(MaxTextureSet, 0, sizeof(MaxTextureSet));
+
+    HRESULT hr;
+
     RECT rc;
-    GetClientRect(window, &rc);
-    UINT width = rc.right - rc.left;
-    UINT height = rc.bottom - rc.top;
-    WindowWidth = width;
-    WindowHeight = height;
-    Window = window;
-
+    if (p.Resolution == Sizei(0))
+    {
+        GetClientRect(window, &rc);
+        UINT width  = rc.right - rc.left;
+        UINT height = rc.bottom - rc.top;
+        ::OVR::Render::RenderDevice::SetWindowSize(width, height);
+    }
+    else
+    {
+        // TBD: This should be renamed to not be tied to window for App mode.
+        ::OVR::Render::RenderDevice::SetWindowSize(p.Resolution.w, p.Resolution.h);
+    }
+    
     Params = p;
-    HRESULT hr = CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)(&DXGIFactory.GetRawRef()));
-    if (FAILED(hr))    
+    DXGIFactory = NULL;
+    hr = CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)(&DXGIFactory.GetRawRef()));
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
         return;
+    }
 
     // Find the adapter & output (monitor) to use for fullscreen, based on the reported name of the HMD's monitor.
     if (Params.Display.MonitorName.GetLength() > 0)
     {
         for(UINT AdapterIndex = 0; ; AdapterIndex++)
         {
+			Adapter = NULL;
             HRESULT hr = DXGIFactory->EnumAdapters(AdapterIndex, &Adapter.GetRawRef());
             if (hr == DXGI_ERROR_NOT_FOUND)
                 break;
+            if (FAILED(hr))
+            {
+                OVR_LOG_COM_ERROR(hr);
+            }
 
             DXGI_ADAPTER_DESC Desc;
-            Adapter->GetDesc(&Desc);
+            hr = Adapter->GetDesc(&Desc);
+            if (FAILED(hr))
+            {
+                OVR_LOG_COM_ERROR(hr);
+            }
 
             UpdateMonitorOutputs();
 
@@ -355,24 +844,37 @@ RenderDevice::RenderDevice(const RendererParams& p, HWND window)
 
     if (!Adapter)
     {
-        DXGIFactory->EnumAdapters(0, &Adapter.GetRawRef());
+        hr = DXGIFactory->EnumAdapters(0, &Adapter.GetRawRef());
+        if (FAILED(hr))
+        {
+            OVR_LOG_COM_ERROR(hr);
+        }
         UpdateMonitorOutputs();
     }
 
-    int flags = 0;
+    int flags = D3D10_CREATE_DEVICE_BGRA_SUPPORT; //0;
 
 #if (OVR_D3D_VERSION == 10)
-    hr = D3D10CreateDevice(Adapter, D3D10_DRIVER_TYPE_HARDWARE, NULL, flags, D3D1x_(SDK_VERSION),
+    Device = NULL;
+    hr = D3D10CreateDevice1(Adapter, D3D10_DRIVER_TYPE_HARDWARE, NULL, flags, D3D10_FEATURE_LEVEL_10_1, D3D10_1_SDK_VERSION,
                            &Device.GetRawRef());
     Context = Device;
     Context->AddRef();
 #else //11
+    Device = NULL;
+    Context = NULL;
+    D3D_FEATURE_LEVEL featureLevel; // TODO: Limit certain features based on D3D feature level
     hr = D3D11CreateDevice(Adapter, Adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
-                           NULL, flags, NULL, 0, D3D1x_(SDK_VERSION),
-                           &Device.GetRawRef(), NULL, &Context.GetRawRef());
+                           NULL, flags /*| D3D11_CREATE_DEVICE_DEBUG*/, NULL, 0, D3D1x_(SDK_VERSION),
+                           &Device.GetRawRef(), &featureLevel, &Context.GetRawRef());
 #endif
-    if (FAILED(hr))
-        return;
+	if (FAILED(hr))
+	{
+        OVR_LOG_COM_ERROR(hr);
+        LogError("{ERR-019w} [D3D1X] Unable to create device: %x", hr);
+        OVR_ASSERT(false);
+		return;
+	}
 
     if (!RecreateSwapChain())
         return;
@@ -387,24 +889,68 @@ RenderDevice::RenderDevice(const RendererParams& p, HWND window)
         MaxTextureSet[i] = 0;
     }
 
-    ID3D10Blob* vsData = CompileShader("vs_4_0", DirectVertexShaderSrc);
+    ID3D10Blob* vsData = CompileShader(VShaderSrcs[0].ShaderModel, VShaderSrcs[0].SourceStr);
+
     VertexShaders[VShader_MV] = *new VertexShader(this, vsData);
     for(int i = 1; i < VShader_Count; i++)
     {
-        VertexShaders[i] = *new VertexShader(this, CompileShader("vs_4_0", VShaderSrcs[i]));
+        OVR_ASSERT ( VShaderSrcs[i].SourceStr != NULL );      // You forgot a shader!
+        ID3D10Blob *pShader = CompileShader(VShaderSrcs[i].ShaderModel, VShaderSrcs[i].SourceStr);
+
+        VertexShaders[i] = NULL;
+        if ( pShader != NULL )
+        {
+            VertexShaders[i] = *new VertexShader(this, pShader);
+        }
     }
 
     for(int i = 0; i < FShader_Count; i++)
     {
-        PixelShaders[i] = *new PixelShader(this, CompileShader("ps_4_0", FShaderSrcs[i]));
+        OVR_ASSERT ( FShaderSrcs[i].SourceStr != NULL );      // You forgot a shader!
+        ID3D10Blob *pShader = CompileShader(FShaderSrcs[i].ShaderModel, FShaderSrcs[i].SourceStr);
+
+        PixelShaders[i] = NULL;
+        if ( pShader != NULL )
+        {
+            PixelShaders[i] = *new PixelShader(this, pShader);
+        }
     }
 
-    SPInt bufferSize = vsData->GetBufferSize();
+    intptr_t bufferSize = vsData->GetBufferSize();
     const void* buffer = vsData->GetBufferPointer();
+    ModelVertexIL = NULL;
     ID3D1xInputLayout** objRef = &ModelVertexIL.GetRawRef();
+    hr = Device->CreateInputLayout(ModelVertexDesc, sizeof(ModelVertexDesc)/sizeof(ModelVertexDesc[0]), buffer, bufferSize, objRef);
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
+    }
 
-    HRESULT validate = Device->CreateInputLayout(ModelVertexDesc, 5, buffer, bufferSize, objRef);
-    OVR_UNUSED(validate);
+    {
+        ID3D10Blob* vsData2 = CompileShader("vs_4_1", PostProcessMeshVertexShaderSrc);
+        intptr_t bufferSize2 = vsData2->GetBufferSize();
+        const void* buffer2 = vsData2->GetBufferPointer();
+        DistortionVertexIL = NULL;
+        ID3D1xInputLayout** objRef2 = &DistortionVertexIL.GetRawRef();
+        hr = Device->CreateInputLayout(DistortionVertexDesc, sizeof(DistortionVertexDesc)/sizeof(DistortionVertexDesc[0]), buffer2, bufferSize2, objRef2);
+        if (FAILED(hr))
+        {
+            OVR_LOG_COM_ERROR(hr);
+        }
+    }
+
+    {
+        ID3D10Blob* vsData2 = CompileShader("vs_4_1", PostProcessHeightmapTimewarpVertexShaderSrc);
+        intptr_t bufferSize2 = vsData2->GetBufferSize();
+        const void* buffer2 = vsData2->GetBufferPointer();
+        HeightmapVertexIL = NULL;
+        ID3D1xInputLayout** objRef2 = &HeightmapVertexIL.GetRawRef();
+        hr = Device->CreateInputLayout(HeightmapVertexDesc, sizeof(HeightmapVertexDesc)/sizeof(HeightmapVertexDesc[0]), buffer2, bufferSize2, objRef2);
+        if (FAILED(hr))
+        {
+            OVR_LOG_COM_ERROR(hr);
+        }
+    }
 
     Ptr<ShaderSet> gouraudShaders = *new ShaderSet();
     gouraudShaders->SetShader(VertexShaders[VShader_MVP]);
@@ -416,35 +962,49 @@ RenderDevice::RenderDevice(const RendererParams& p, HWND window)
     memset(&bm, 0, sizeof(bm));
     bm.BlendEnable[0] = true;
     bm.BlendOp      = bm.BlendOpAlpha   = D3D1x_(BLEND_OP_ADD);
-    bm.SrcBlend     = bm.SrcBlendAlpha  = D3D1x_(BLEND_SRC_ALPHA);
+    bm.SrcBlend     = bm.SrcBlendAlpha  = D3D1x_(BLEND_ONE); //premultiplied alpha
     bm.DestBlend    = bm.DestBlendAlpha = D3D1x_(BLEND_INV_SRC_ALPHA);
     bm.RenderTargetWriteMask[0]         = D3D1x_(COLOR_WRITE_ENABLE_ALL);
-    Device->CreateBlendState(&bm, &BlendState.GetRawRef());
+    BlendState = NULL;
+    hr = Device->CreateBlendState(&bm, &BlendState.GetRawRef());
 #else
     D3D1x_(BLEND_DESC) bm;
     memset(&bm, 0, sizeof(bm));
     bm.RenderTarget[0].BlendEnable = true;
     bm.RenderTarget[0].BlendOp     = bm.RenderTarget[0].BlendOpAlpha    = D3D1x_(BLEND_OP_ADD);
-    bm.RenderTarget[0].SrcBlend    = bm.RenderTarget[0].SrcBlendAlpha   = D3D1x_(BLEND_SRC_ALPHA);
+    bm.RenderTarget[0].SrcBlend    = bm.RenderTarget[0].SrcBlendAlpha   = D3D1x_(BLEND_ONE); //premultiplied alpha
     bm.RenderTarget[0].DestBlend   = bm.RenderTarget[0].DestBlendAlpha  = D3D1x_(BLEND_INV_SRC_ALPHA);
     bm.RenderTarget[0].RenderTargetWriteMask = D3D1x_(COLOR_WRITE_ENABLE_ALL);
-    Device->CreateBlendState(&bm, &BlendState.GetRawRef());
+    BlendState = NULL;
+    hr = Device->CreateBlendState(&bm, &BlendState.GetRawRef());
 #endif
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
+    }
 
     D3D1x_(RASTERIZER_DESC) rs;
     memset(&rs, 0, sizeof(rs));
-    rs.AntialiasedLineEnable = true;
+    rs.AntialiasedLineEnable = false;       // You can't just turn this on - it needs alpha modes etc setting up and doesn't work with Z buffers.
     rs.CullMode = D3D1x_(CULL_BACK);
     // rs.CullMode = D3D1x_(CULL_NONE);
     rs.DepthClipEnable = true;
     rs.FillMode = D3D1x_(FILL_SOLID);
-    Device->CreateRasterizerState(&rs, &Rasterizer.GetRawRef());
+    Rasterizer = NULL;
+    hr = Device->CreateRasterizerState(&rs, &Rasterizer.GetRawRef());
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
+    }
 
     QuadVertexBuffer = *CreateBuffer();
     const Render::Vertex QuadVertices[] =
     { Vertex(Vector3f(0, 1, 0)), Vertex(Vector3f(1, 1, 0)),
       Vertex(Vector3f(0, 0, 0)), Vertex(Vector3f(1, 0, 0)) };
-    QuadVertexBuffer->Data(Buffer_Vertex, QuadVertices, sizeof(QuadVertices));
+    if (!QuadVertexBuffer->Data(Buffer_Vertex | Buffer_ReadOnly, QuadVertices, sizeof(QuadVertices)))
+    {
+        OVR_ASSERT(false);
+    }
 
     SetDepthMode(0, 0);
 }
@@ -453,7 +1013,11 @@ RenderDevice::~RenderDevice()
 {
     if (SwapChain && Params.Fullscreen)
     {
-        SwapChain->SetFullscreenState(false, NULL);
+        HRESULT hr = SwapChain->SetFullscreenState(false, NULL);
+        if (FAILED(hr))
+        {
+            OVR_LOG_COM_ERROR(hr);
+        }
     }
 }
 
@@ -461,7 +1025,25 @@ RenderDevice::~RenderDevice()
 // Implement static initializer function to create this class.
 Render::RenderDevice* RenderDevice::CreateDevice(const RendererParams& rp, void* oswnd)
 {
-    return new RenderDevice(rp, (HWND)oswnd);
+#if (OVR_D3D_VERSION == 10)
+    Render::D3D10::RenderDevice* render = new RenderDevice(rp, (HWND)oswnd);
+#else
+    Render::D3D11::RenderDevice* render = new RenderDevice(rp, (HWND)oswnd);
+#endif
+    // Sanity check to make sure our resources were created.
+    // This should stop a lot of driver related crashes we have experienced
+    if ((render->DXGIFactory == NULL) || (render->Device == NULL) || (render->SwapChain == NULL))
+    {
+        OVR_ASSERT(false);
+        // TBD: Probabaly other things like shader creation should be verified as well
+        render->Shutdown();
+        render->Release();
+        return NULL;
+    }
+    else
+    {
+        return render;
+    }
 }
 
 
@@ -474,16 +1056,16 @@ BOOL CALLBACK MonitorEnumFunc(HMONITOR hMonitor, HDC, LPRECT, LPARAM dwData)
 {
     RenderDevice* renderer = (RenderDevice*)dwData;
 
-    MONITORINFOEX monitor;
+    MONITORINFOEXA monitor;
     monitor.cbSize = sizeof(monitor);
 
-    if (::GetMonitorInfo(hMonitor, &monitor) && monitor.szDevice[0])
+    if (::GetMonitorInfoA(hMonitor, &monitor) && monitor.szDevice[0])
     {
-        DISPLAY_DEVICE dispDev;
+        DISPLAY_DEVICEA dispDev;
         memset(&dispDev, 0, sizeof(dispDev));
         dispDev.cb = sizeof(dispDev);
 
-        if (::EnumDisplayDevices(monitor.szDevice, 0, &dispDev, 0))
+        if (::EnumDisplayDevicesA(monitor.szDevice, 0, &dispDev, 0))
         {
             if (strstr(String(dispDev.DeviceName).ToCStr(), renderer->GetParams().Display.MonitorName.ToCStr()))
             {
@@ -508,17 +1090,27 @@ void RenderDevice::UpdateMonitorOutputs(bool needRecreate)
         // to get latest info about monitors.
         if (SwapChain)
         {
-            SwapChain->SetFullscreenState(FALSE, NULL);
-            SwapChain->Release();
+            hr = SwapChain->SetFullscreenState(FALSE, NULL);
+            if (FAILED(hr))
+            {
+                OVR_LOG_COM_ERROR(hr);
+            }
             SwapChain = NULL;
         }
 
         DXGIFactory = NULL;
         Adapter = NULL;
         hr = CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)(&DXGIFactory.GetRawRef()));
-        if (FAILED(hr))    
+        if (FAILED(hr))
+        {
+            OVR_LOG_COM_ERROR(hr);
             return;
-        DXGIFactory->EnumAdapters(0, &Adapter.GetRawRef());
+        }
+        hr = DXGIFactory->EnumAdapters(0, &Adapter.GetRawRef());
+        if (FAILED(hr))
+        {
+            OVR_LOG_COM_ERROR(hr);
+        }
     }
 
     bool deviceNameFound = false;
@@ -531,19 +1123,23 @@ void RenderDevice::UpdateMonitorOutputs(bool needRecreate)
         {
             break;
         }
+        if (FAILED(hr))
+        {
+            OVR_LOG_COM_ERROR(hr);
+        }
 
         DXGI_OUTPUT_DESC OutDesc;
         Output->GetDesc(&OutDesc);
 
-        MONITORINFOEX monitor;
+        MONITORINFOEXA monitor;
         monitor.cbSize = sizeof(monitor);
-        if (::GetMonitorInfo(OutDesc.Monitor, &monitor) && monitor.szDevice[0])
+        if (::GetMonitorInfoA(OutDesc.Monitor, &monitor) && monitor.szDevice[0])
         {
-            DISPLAY_DEVICE dispDev;
+            DISPLAY_DEVICEA dispDev;
             memset(&dispDev, 0, sizeof(dispDev));
             dispDev.cb = sizeof(dispDev);
 
-            if (::EnumDisplayDevices(monitor.szDevice, 0, &dispDev, 0))
+            if (::EnumDisplayDevicesA(monitor.szDevice, 0, &dispDev, 0))
             {
                 if (strstr(String(dispDev.DeviceName).ToCStr(), Params.Display.MonitorName.ToCStr()))
                 {
@@ -559,19 +1155,25 @@ void RenderDevice::UpdateMonitorOutputs(bool needRecreate)
 
     if (!deviceNameFound && !Params.Display.MonitorName.IsEmpty())
     {
-        EnumDisplayMonitors(0, 0, MonitorEnumFunc, (LPARAM)this);
+        if (!EnumDisplayMonitors(0, 0, MonitorEnumFunc, (LPARAM)this))
+        {
+            OVR_ASSERT(false);
+        }
     }
 }
 
 bool RenderDevice::RecreateSwapChain()
 {
+    HRESULT hr;
+
     DXGI_SWAP_CHAIN_DESC scDesc;
     memset(&scDesc, 0, sizeof(scDesc));
     scDesc.BufferCount = 1;
-    scDesc.BufferDesc.Width = WindowWidth;
+    scDesc.BufferDesc.Width  = WindowWidth;
     scDesc.BufferDesc.Height = WindowHeight;
-    scDesc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    scDesc.BufferDesc.RefreshRate.Numerator = 60;
+    scDesc.BufferDesc.Format = Params.SrgbBackBuffer ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+    // Use default refresh rate; switching rate on CC prototype can cause screen lockup.
+    scDesc.BufferDesc.RefreshRate.Numerator = 0;
     scDesc.BufferDesc.RefreshRate.Denominator = 1;
     scDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scDesc.OutputWindow = Window;
@@ -582,29 +1184,42 @@ bool RenderDevice::RecreateSwapChain()
 
 	if (SwapChain)
 	{
-		SwapChain->SetFullscreenState(FALSE, NULL);
-		SwapChain->Release();
-		SwapChain = NULL;
+		hr = SwapChain->SetFullscreenState(FALSE, NULL);
+        if (FAILED(hr))
+        {
+            OVR_LOG_COM_ERROR(hr);
+        }
+        SwapChain = NULL;
 	}
 
     Ptr<IDXGISwapChain> newSC;
-    if (FAILED(DXGIFactory->CreateSwapChain(Device, &scDesc, &newSC.GetRawRef())))
-        return false;    
+    hr = DXGIFactory->CreateSwapChain(Device, &scDesc, &newSC.GetRawRef());
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
+        return false;
+    }
     SwapChain = newSC;
 
     BackBuffer = NULL;
     BackBufferRT = NULL;
-    HRESULT hr = SwapChain->GetBuffer(0, __uuidof(ID3D1xTexture2D), (void**)&BackBuffer.GetRawRef());
+    hr = SwapChain->GetBuffer(0, __uuidof(ID3D1xTexture2D), (void**)&BackBuffer.GetRawRef());
     if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
         return false;
+    }
 
     hr = Device->CreateRenderTargetView(BackBuffer, NULL, &BackBufferRT.GetRawRef());
     if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
         return false;
+    }
 
     Texture* depthBuffer = GetDepthBuffer(WindowWidth, WindowHeight, Params.Multisample);
     CurDepthBuffer = depthBuffer;
-    if (CurRenderTarget == NULL)
+	if (CurRenderTarget == NULL && depthBuffer != NULL)
     {
         Context->OMSetRenderTargets(1, &BackBufferRT.GetRawRef(), depthBuffer->TexDsv);
     }
@@ -621,27 +1236,61 @@ bool RenderDevice::SetParams(const RendererParams& newParams)
         UpdateMonitorOutputs(true);
     }
 
-    // Cause this to be recreated with the new multisample mode.
-    pSceneColorTex = NULL;
     return RecreateSwapChain();
+}
+	
+ovrRenderAPIConfig RenderDevice::Get_ovrRenderAPIConfig() const
+{
+#if (OVR_D3D_VERSION == 10)
+	static ovrD3D10Config cfg;
+	cfg.D3D10.Header.API         = ovrRenderAPI_D3D10;
+	cfg.D3D10.Header.RTSize      = Sizei(WindowWidth, WindowHeight);
+	cfg.D3D10.Header.Multisample = Params.Multisample;
+	cfg.D3D10.pDevice            = Device;
+	cfg.D3D10.pBackBufferRT      = BackBufferRT;
+	cfg.D3D10.pSwapChain         = SwapChain;
+#else
+	static ovrD3D11Config cfg;
+	cfg.D3D11.Header.API         = ovrRenderAPI_D3D11;
+	cfg.D3D11.Header.RTSize      = Sizei(WindowWidth, WindowHeight);
+	cfg.D3D11.Header.Multisample = Params.Multisample;
+	cfg.D3D11.pDevice            = Device;
+	cfg.D3D11.pDeviceContext     = Context;
+	cfg.D3D11.pBackBufferRT      = BackBufferRT;
+	cfg.D3D11.pSwapChain         = SwapChain;
+#endif
+	return cfg.Config;
+}
+
+ovrTexture Texture::Get_ovrTexture()
+{
+	ovrTexture tex;
+
+	OVR::Sizei newRTSize(Width, Height);
+	
+#if (OVR_D3D_VERSION == 10)
+    ovrD3D10TextureData* texData = (ovrD3D10TextureData*)&tex;
+    texData->Header.API            = ovrRenderAPI_D3D10;
+#else
+    ovrD3D11TextureData* texData = (ovrD3D11TextureData*)&tex;
+    texData->Header.API            = ovrRenderAPI_D3D11;
+#endif
+    texData->Header.TextureSize    = newRTSize;
+    texData->Header.RenderViewport = Recti(newRTSize);
+    texData->pTexture              = Tex;
+    texData->pSRView               = TexSv;
+
+	return tex;
 }
 
 void RenderDevice::SetWindowSize(int w, int h)
 {
-    if (w == WindowWidth && h == WindowHeight)
-        return;
-
-    WindowWidth  = w;
-    WindowHeight = h;
-    Context->OMSetRenderTargets(0, NULL, NULL);
-    BackBuffer   = NULL;
-    BackBufferRT = NULL;
-    if (SwapChain)
-    {
-        SwapChain->ResizeBuffers(2, WindowWidth, WindowHeight, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
-        SwapChain->GetBuffer(0, __uuidof(ID3D1xTexture2D), (void**)&BackBuffer.GetRawRef());
-    }
-    Device->CreateRenderTargetView(BackBuffer, NULL, &BackBufferRT.GetRawRef());
+	// This code is rendered a no-op
+	// It interferes with proper driver operation in
+	// application mode and doesn't add any value in
+	// compatibility mode
+	OVR_UNUSED(w);
+	OVR_UNUSED(h);
 }
 
 bool RenderDevice::SetFullscreen(DisplayMode fullscreen)
@@ -690,6 +1339,7 @@ bool RenderDevice::SetFullscreen(DisplayMode fullscreen)
         HRESULT hr = SwapChain->SetFullscreenState(fullscreen, fullscreen ? FullscreenOutput : NULL);
         if (FAILED(hr))
         {
+            OVR_LOG_COM_ERROR(hr);
             return false;
         }
     }
@@ -698,32 +1348,24 @@ bool RenderDevice::SetFullscreen(DisplayMode fullscreen)
     return true;
 }
 
-void RenderDevice::SetMultipleViewports(int n, const Viewport* vps)
+void RenderDevice::SetViewport(const Recti& vp)
 {
-    if (n > 2)
-    {
-        n = 2;
-    }
-    for(int i = 0; i < n; i++)
-    {
 #if (OVR_D3D_VERSION == 10)
-        Viewports[i].Width = vps[i].w;
-        Viewports[i].Height = vps[i].h;
-        Viewports[i].MinDepth = 0;
-        Viewports[i].MaxDepth = 1;
-        Viewports[i].TopLeftX = vps[i].x;
-        Viewports[i].TopLeftY = vps[i].y;
+    D3DViewport.Width    = vp.w;
+    D3DViewport.Height   = vp.h;
+    D3DViewport.MinDepth = 0;
+    D3DViewport.MaxDepth = 1;
+    D3DViewport.TopLeftX = vp.x;
+    D3DViewport.TopLeftY = vp.y;
 #else
-        Viewports[i].Width = (float)vps[i].w;
-        Viewports[i].Height = (float)vps[i].h;
-        Viewports[i].MinDepth = 0;
-        Viewports[i].MaxDepth = 1;
-        Viewports[i].TopLeftX = (float)vps[i].x;
-        Viewports[i].TopLeftY = (float)vps[i].y;
+    D3DViewport.Width    = (float)vp.w;
+    D3DViewport.Height   = (float)vp.h;
+    D3DViewport.MinDepth = 0;
+    D3DViewport.MaxDepth = 1;
+    D3DViewport.TopLeftX = (float)vp.x;
+    D3DViewport.TopLeftY = (float)vp.y;
 #endif
-    }
-    NumViewports = n;
-    Context->RSSetViewports(n, Viewports);
+    Context->RSSetViewports(1,&D3DViewport);
 }
 
 static int GetDepthStateIndex(bool enable, bool write, RenderDevice::CompareFunc func)
@@ -754,10 +1396,14 @@ void RenderDevice::SetDepthMode(bool enable, bool write, CompareFunc func)
     case Compare_Less:    dss.DepthFunc = D3D1x_(COMPARISON_LESS);    break;
     case Compare_Greater: dss.DepthFunc = D3D1x_(COMPARISON_GREATER); break;
     default:
-        assert(0);
+        OVR_ASSERT(0);
     }
     dss.DepthWriteMask = write ? D3D1x_(DEPTH_WRITE_MASK_ALL) : D3D1x_(DEPTH_WRITE_MASK_ZERO);
-    Device->CreateDepthStencilState(&dss, &DepthStates[index].GetRawRef());
+    HRESULT hr = Device->CreateDepthStencilState(&dss, &DepthStates[index].GetRawRef());
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
+    }
     Context->OMSetDepthStencilState(DepthStates[index], 0);
     CurDepthState = DepthStates[index];
 }
@@ -782,70 +1428,27 @@ Texture* RenderDevice::GetDepthBuffer(int w, int h, int ms)
     return newDepth.GetPtr();
 }
 
-void RenderDevice::Clear(float r, float g, float b, float a, float depth)
+void RenderDevice::Clear(float r /*= 0*/, float g /*= 0*/, float b /*= 0*/, float a /*= 1*/,
+                         float depth /*= 1*/,
+                         bool clearColor /*= true*/, bool clearDepth /*= true*/)
 {
-    const float color[] = {r, g, b, a};
-
-	// save state that is affected by clearing this way
-    ID3D1xDepthStencilState* oldDepthState = CurDepthState;
-	StandardUniformData      clearUniforms;
-
-    SetDepthMode(true, true, Compare_Always);
-		
-    Context->IASetInputLayout(ModelVertexIL);
-#if (OVR_D3D_VERSION == 10)
-    Context->GSSetShader(NULL);
-#else
-    Context->GSSetShader(NULL, NULL, 0);
-#endif
-    //Shader<Shader_Geometry,ID3D1xGeometryShader> NullGS(this,(ID3D1xGeometryShader*)NULL);
-    //NullGS.Set(Prim_TriangleStrip);
-
-    ID3D1xShaderResourceView* sv[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    if (MaxTextureSet[Shader_Fragment])
+    if ( clearColor )
     {
-        Context->PSSetShaderResources(0, MaxTextureSet[Shader_Fragment], sv);
-    }
-
-    ID3D1xBuffer* vertexBuffer = QuadVertexBuffer->GetBuffer();
-    UINT vertexStride = sizeof(Vertex);
-    UINT vertexOffset = 0;
-    Context->IASetVertexBuffers(0, 1, &vertexBuffer, &vertexStride, &vertexOffset);
-
-    clearUniforms.View = Matrix4f(2, 0, 0, 0,
-                                    0, 2, 0, 0,
-                                    0, 0, 0, 0,
-                                    -1, -1, depth, 1);
-    UniformBuffers[Shader_Vertex]->Data(Buffer_Uniform, &clearUniforms, sizeof(clearUniforms));
-
-    ID3D1xBuffer* vertexConstants = UniformBuffers[Shader_Vertex]->GetBuffer();
-    Context->VSSetConstantBuffers(0, 1, &vertexConstants);
-    Context->IASetPrimitiveTopology(D3D1x_(PRIMITIVE_TOPOLOGY_TRIANGLESTRIP));
-    VertexShaders[VShader_MV]->Set(Prim_TriangleStrip);
-    PixelShaders[FShader_Solid]->Set(Prim_TriangleStrip);
-
-    UniformBuffers[Shader_Pixel]->Data(Buffer_Uniform, color, sizeof(color));
-    PixelShaders[FShader_Solid]->SetUniformBuffer(UniformBuffers[Shader_Pixel]);
-
-    if (NumViewports > 1)
-    {
-        for(int i = 0; i < NumViewports; i++)
+        const float color[] = {r, g, b, a};
+        if ( CurRenderTarget == NULL )
         {
-            Context->RSSetViewports(1, &Viewports[i]);
-            Context->OMSetBlendState(NULL, NULL, 0xffffffff);
-            Context->Draw(4, 0);
+            Context->ClearRenderTargetView ( BackBufferRT.GetRawRef(), color );
         }
-        Context->RSSetViewports(NumViewports, Viewports);
-    }
-    else
-    {
-		Context->OMSetBlendState(NULL, NULL, 0xffffffff);
-		Context->Draw(4, 0);
+        else
+        {
+            Context->ClearRenderTargetView ( CurRenderTarget->TexRtv, color );
+        }
     }
 
-    // reset
-    CurDepthState = oldDepthState;
-    Context->OMSetDepthStencilState(CurDepthState, 0);
+    if ( clearDepth )
+    {
+        Context->ClearDepthStencilView ( CurDepthBuffer->TexDsv, D3D10_CLEAR_DEPTH | D3D10_CLEAR_STENCIL, depth, 0 );
+    }
 }
 
 // Buffers
@@ -878,6 +1481,7 @@ bool   Buffer::Data(int use, const void *buffer, size_t size)
         }
         else
         {
+            OVR_ASSERT (!(use & Buffer_ReadOnly));
             Ren->Context->UpdateSubresource(D3DBuffer, 0, NULL, buffer, 0, 0);
             return true;
         }
@@ -927,12 +1531,17 @@ bool   Buffer::Data(int use, const void *buffer, size_t size)
     sr.SysMemPitch = 0;
     sr.SysMemSlicePitch = 0;
 
+    D3DBuffer = NULL;
     HRESULT hr = Ren->Device->CreateBuffer(&desc, buffer ? &sr : NULL, &D3DBuffer.GetRawRef());
     if (SUCCEEDED(hr))
     {
         Use = use;
         Size = desc.ByteWidth;
         return 1;
+    }
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
     }
     return 0;
 }
@@ -962,7 +1571,7 @@ void*  Buffer::Map(size_t start, size_t size, int flags)
 #endif
 }
 
-bool   Buffer::Unmap(void *m)
+bool   Buffer::Unmap(void* m)
 {
     OVR_UNUSED(m);
 
@@ -980,15 +1589,30 @@ bool   Buffer::Unmap(void *m)
 #if (OVR_D3D_VERSION == 10)
 template<> bool Shader<Render::Shader_Vertex, ID3D10VertexShader>::Load(void* shader, size_t size)
 {
-    return SUCCEEDED(Ren->Device->CreateVertexShader(shader, size, &D3DShader));
+    HRESULT hr = Ren->Device->CreateVertexShader(shader, size, &D3DShader);
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
+    }
+    return SUCCEEDED(hr);
 }
 template<> bool Shader<Render::Shader_Pixel, ID3D10PixelShader>::Load(void* shader, size_t size)
 {
-    return SUCCEEDED(Ren->Device->CreatePixelShader(shader, size, &D3DShader));
+    HRESULT hr = Ren->Device->CreatePixelShader(shader, size, &D3DShader);
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
+    }
+    return SUCCEEDED(hr);
 }
 template<> bool Shader<Render::Shader_Geometry, ID3D10GeometryShader>::Load(void* shader, size_t size)
 {
-    return SUCCEEDED(Ren->Device->CreateGeometryShader(shader, size, &D3DShader));
+    HRESULT hr = Ren->Device->CreateGeometryShader(shader, size, &D3DShader);
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
+    }
+    return SUCCEEDED(hr);
 }
 
 template<> void Shader<Render::Shader_Vertex, ID3D10VertexShader>::Set(PrimitiveType) const
@@ -1007,15 +1631,30 @@ template<> void Shader<Render::Shader_Geometry, ID3D10GeometryShader>::Set(Primi
 #else // 11
 template<> bool Shader<Render::Shader_Vertex, ID3D11VertexShader>::Load(void* shader, size_t size)
 {
-    return SUCCEEDED(Ren->Device->CreateVertexShader(shader, size, NULL, &D3DShader));
+    HRESULT hr = Ren->Device->CreateVertexShader(shader, size, NULL, &D3DShader);
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
+    }
+    return SUCCEEDED(hr);
 }
 template<> bool Shader<Render::Shader_Pixel, ID3D11PixelShader>::Load(void* shader, size_t size)
 {
-    return SUCCEEDED(Ren->Device->CreatePixelShader(shader, size, NULL, &D3DShader));
+    HRESULT hr = Ren->Device->CreatePixelShader(shader, size, NULL, &D3DShader);
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
+    }
+    return SUCCEEDED(hr);
 }
 template<> bool Shader<Render::Shader_Geometry, ID3D11GeometryShader>::Load(void* shader, size_t size)
 {
-    return SUCCEEDED(Ren->Device->CreateGeometryShader(shader, size, NULL, &D3DShader));
+    HRESULT hr = Ren->Device->CreateGeometryShader(shader, size, NULL, &D3DShader);
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
+    }
+    return SUCCEEDED(hr);
 }
 
 template<> void Shader<Render::Shader_Vertex, ID3D11VertexShader>::Set(PrimitiveType) const
@@ -1056,6 +1695,7 @@ ID3D10Blob* RenderDevice::CompileShader(const char* profile, const char* src, co
         OVR_DEBUG_LOG(("Compiling D3D shader for %s failed\n%s\n\n%s",
                        profile, src, errors->GetBufferPointer()));
         OutputDebugStringA((char*)errors->GetBufferPointer());
+        OVR_LOG_COM_ERROR(hr);
         return NULL;
     }
     if (errors)
@@ -1066,37 +1706,51 @@ ID3D10Blob* RenderDevice::CompileShader(const char* profile, const char* src, co
 }
 
 
-ShaderBase::ShaderBase(RenderDevice* r, ShaderStage stage)
-    : Render::Shader(stage), Ren(r), UniformData(0)
+ShaderBase::ShaderBase(RenderDevice* r, ShaderStage stage) :
+    Render::Shader(stage),
+    Ren(r),
+    UniformData(NULL),
+    UniformsSize(-1)
 {
 }
+
 ShaderBase::~ShaderBase()
 {
     if (UniformData)
     {
         OVR_FREE(UniformData);
+        UniformData = NULL;
     }
 }
 
 bool ShaderBase::SetUniform(const char* name, int n, const float* v)
 {
-    for(unsigned i = 0; i < UniformInfo.GetSize(); i++)
-        if (!strcmp(UniformInfo[i].Name.ToCStr(), name))
+    for (int i = 0; i < UniformInfo.GetSizeI(); i++)
+    {
+        if (UniformInfo[i].Name == name)
         {
             memcpy(UniformData + UniformInfo[i].Offset, v, n * sizeof(float));
-            return 1;
+            return true;
         }
-    return 0;
+    }
+
+    return false;
 }
 
 void ShaderBase::InitUniforms(ID3D10Blob* s)
 {
     ID3D10ShaderReflection* ref = NULL;
-    D3D10ReflectShader(s->GetBufferPointer(), s->GetBufferSize(), &ref);
+    HRESULT hr = D3D10ReflectShader(s->GetBufferPointer(), s->GetBufferSize(), &ref);
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
+    }
     ID3D10ShaderReflectionConstantBuffer* buf = ref->GetConstantBufferByIndex(0);
     D3D10_SHADER_BUFFER_DESC bufd;
-    if (FAILED(buf->GetDesc(&bufd)))
+    hr = buf->GetDesc(&bufd);
+    if (FAILED(hr))
     {
+        //OVR_LOG_COM_ERROR(hr); - Seems to happen normally
         UniformsSize = 0;
         if (UniformData)
         {
@@ -1112,13 +1766,18 @@ void ShaderBase::InitUniforms(ID3D10Blob* s)
         if (var)
         {
             D3D10_SHADER_VARIABLE_DESC vd;
-            if (SUCCEEDED(var->GetDesc(&vd)))
+            hr = var->GetDesc(&vd);
+            if (SUCCEEDED(hr))
             {
                 Uniform u;
                 u.Name = vd.Name;
                 u.Offset = vd.StartOffset;
                 u.Size = vd.Size;
                 UniformInfo.PushBack(u);
+            }
+            if (FAILED(hr))
+            {
+                OVR_LOG_COM_ERROR(hr);
             }
         }
     }
@@ -1131,7 +1790,10 @@ void ShaderBase::UpdateBuffer(Buffer* buf)
 {
     if (UniformsSize)
     {
-        buf->Data(Buffer_Uniform, UniformData, UniformsSize);
+        if (!buf->Data(Buffer_Uniform, UniformData, UniformsSize))
+        {
+            OVR_ASSERT(false);
+        }
     }
 }
 
@@ -1263,21 +1925,40 @@ ID3D1xSamplerState* RenderDevice::GetSamplerState(int sm)
     else if (sm & Sample_Anisotropic)
     {
         ss.Filter = D3D1x_(FILTER_ANISOTROPIC);
-        ss.MaxAnisotropy = 8;
+        ss.MaxAnisotropy = 4;
     }
     else
     {
         ss.Filter = D3D1x_(FILTER_MIN_MAG_MIP_LINEAR);
     }
     ss.MaxLOD = 15;
-    Device->CreateSamplerState(&ss, &SamplerStates[sm].GetRawRef());
+    HRESULT hr = Device->CreateSamplerState(&ss, &SamplerStates[sm].GetRawRef());
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
+    }
     return SamplerStates[sm];
 }
 
-Texture::Texture(RenderDevice* ren, int fmt, int w, int h) : Ren(ren), Tex(NULL), TexSv(NULL), TexRtv(NULL), TexDsv(NULL), Width(w), Height(h)
+Texture::Texture(RenderDevice* ren, int fmt, int w, int h) :
+    Ren(ren),
+    Tex(NULL),
+    TexSv(NULL),
+    TexRtv(NULL),
+    TexDsv(NULL),
+    TexStaging(NULL),
+    Sampler(NULL),
+    Format(fmt),
+    Width(w),
+    Height(h),
+    Samples(0)
 {
-    OVR_UNUSED(fmt);
     Sampler = Ren->GetSamplerState(0);
+}
+
+void* Texture::GetInternalImplementation() 
+{ 
+	return Tex;
 }
 
 Texture::~Texture()
@@ -1312,6 +1993,10 @@ void RenderDevice::SetTexture(Render::ShaderStage stage, int slot, const Texture
 
     case Shader_Vertex:
         Context->VSSetShaderResources(slot, 1, &sv);
+        if (t)
+        {
+            Context->VSSetSamplers(slot, 1, &t->Sampler.GetRawRef());
+        }
         break;
     }
 }
@@ -1334,17 +2019,23 @@ void RenderDevice::GenerateSubresourceData(
     unsigned subresHeight = imageHeight;
     unsigned numMips      = effectiveMipCount;
 
+    unsigned bytesPerBlock = 0;
+    switch(format)
+    {
+    case DXGI_FORMAT_BC1_UNORM_SRGB: // fall thru
+    case DXGI_FORMAT_BC1_UNORM: bytesPerBlock = 8;  break;
+
+    case DXGI_FORMAT_BC2_UNORM_SRGB: // fall thru
+    case DXGI_FORMAT_BC2_UNORM: bytesPerBlock = 16;  break;
+
+    case DXGI_FORMAT_BC3_UNORM_SRGB: // fall thru
+    case DXGI_FORMAT_BC3_UNORM: bytesPerBlock = 16;  break;
+
+    default:    OVR_ASSERT(false);
+    }
+
     for(unsigned i = 0; i < numMips; i++)
     {
-        unsigned bytesPerBlock = 0;
-        if (format == DXGI_FORMAT_BC1_UNORM)
-        {
-            bytesPerBlock = 8;
-        }
-        else if (format == DXGI_FORMAT_BC3_UNORM)
-        {
-            bytesPerBlock = 16;
-        }
 
         unsigned blockWidth = 0;
         blockWidth = (subresWidth + 3) / 4;
@@ -1404,14 +2095,28 @@ void RenderDevice::GenerateSubresourceData(
 
 Texture* RenderDevice::CreateTexture(int format, int width, int height, const void* data, int mipcount)
 {
-    UPInt gpuMemorySize = 0;
+    OVR_ASSERT(Device != NULL);
+    
+    size_t gpuMemorySize = 0;
     {
         IDXGIDevice* pDXGIDevice;
-        Device->QueryInterface(__uuidof(IDXGIDevice), (void **)&pDXGIDevice);
+        HRESULT hr = Device->QueryInterface(__uuidof(IDXGIDevice), (void **)&pDXGIDevice);
+        if (FAILED(hr))
+        {
+            OVR_LOG_COM_ERROR(hr);
+        }
         IDXGIAdapter * pDXGIAdapter;
-        pDXGIDevice->GetAdapter(&pDXGIAdapter);
+        hr = pDXGIDevice->GetAdapter(&pDXGIAdapter);
+        if (FAILED(hr))
+        {
+            OVR_LOG_COM_ERROR(hr);
+        }
         DXGI_ADAPTER_DESC adapterDesc;
-        pDXGIAdapter->GetDesc(&adapterDesc);
+        hr = pDXGIAdapter->GetDesc(&adapterDesc);
+        if (FAILED(hr))
+        {
+            OVR_LOG_COM_ERROR(hr);
+        }
         gpuMemorySize = adapterDesc.DedicatedVideoMemory;
         pDXGIAdapter->Release();
         pDXGIDevice->Release();
@@ -1427,40 +2132,47 @@ Texture* RenderDevice::CreateTexture(int format, int width, int height, const vo
         imageDimUpperLimit = 1024;
     } 
 
-    if (format == Texture_DXT1 || format == Texture_DXT5)
+	if ((format & Texture_TypeMask) == Texture_DXT1 ||
+        (format & Texture_TypeMask) == Texture_DXT3 ||
+        (format & Texture_TypeMask) == Texture_DXT5)
     {
-        int      convertedFormat   = (format == Texture_DXT1) ? DXGI_FORMAT_BC1_UNORM : DXGI_FORMAT_BC3_UNORM;
+		int convertedFormat;
+        if((format & Texture_TypeMask) == Texture_DXT1)
+        {
+            convertedFormat = (format & Texture_SRGB) ? DXGI_FORMAT_BC1_UNORM_SRGB : DXGI_FORMAT_BC1_UNORM;
+        }
+        else if((format & Texture_TypeMask) == Texture_DXT3)
+        {
+            convertedFormat = (format & Texture_SRGB) ? DXGI_FORMAT_BC2_UNORM_SRGB : DXGI_FORMAT_BC2_UNORM;
+        }
+		else if((format & Texture_TypeMask) == Texture_DXT5)
+        {
+            convertedFormat = (format & Texture_SRGB) ? DXGI_FORMAT_BC3_UNORM_SRGB : DXGI_FORMAT_BC3_UNORM;
+        }
+        else
+        {
+            OVR_ASSERT(false);  return NULL;
+        }
+
         unsigned largestMipWidth   = 0;
         unsigned largestMipHeight  = 0;
         unsigned effectiveMipCount = mipcount;
         unsigned textureSize       = 0;
 
-#ifdef OVR_DEFINE_NEW
-#undef new
-#endif
-        
         D3D1x_(SUBRESOURCE_DATA)* subresData = (D3D1x_(SUBRESOURCE_DATA)*)
                                                 OVR_ALLOC(sizeof(D3D1x_(SUBRESOURCE_DATA)) * mipcount);
         GenerateSubresourceData(width, height, convertedFormat, imageDimUpperLimit, data, subresData, largestMipWidth,
                                 largestMipHeight, textureSize, effectiveMipCount);
         TotalTextureMemoryUsage += textureSize;
 
-#ifdef OVR_DEFINE_NEW
-#define new OVR_DEFINE_NEW
-#endif
-
         if (!Device || !subresData)
         {
             return NULL;
         }
-        int samples = (Texture_RGBA & Texture_SamplesMask);
-        if (samples < 1)
-        {
-            samples = 1;
-        }
 
         Texture* NewTex = new Texture(this, format, largestMipWidth, largestMipHeight);
-        NewTex->Samples = samples;
+        // BCn/DXTn - no AA.
+        NewTex->Samples = 1;
 
         D3D1x_(TEXTURE2D_DESC) desc;
         desc.Width      = largestMipWidth;
@@ -1468,16 +2180,21 @@ Texture* RenderDevice::CreateTexture(int format, int width, int height, const vo
         desc.MipLevels  = effectiveMipCount;
         desc.ArraySize  = 1;
         desc.Format     = static_cast<DXGI_FORMAT>(convertedFormat);
-        desc.SampleDesc.Count = samples;
+        desc.SampleDesc.Count = 1;
         desc.SampleDesc.Quality = 0;
         desc.Usage      = D3D1x_(USAGE_DEFAULT);
         desc.BindFlags  = D3D1x_(BIND_SHADER_RESOURCE);
         desc.CPUAccessFlags = 0;
         desc.MiscFlags  = 0;
 
+        NewTex->Tex = NULL;
         HRESULT hr = Device->CreateTexture2D(&desc, static_cast<D3D1x_(SUBRESOURCE_DATA)*>(subresData),
                                              &NewTex->Tex.GetRawRef());
         OVR_FREE(subresData);
+        if (FAILED(hr))
+        {
+            OVR_LOG_COM_ERROR(hr);
+        }
 
         if (SUCCEEDED(hr) && NewTex != 0)
         {
@@ -1487,10 +2204,12 @@ Texture* RenderDevice::CreateTexture(int format, int width, int height, const vo
             SRVDesc.ViewDimension = D3D_SRV_DIMENSION_TEXTURE2D;
             SRVDesc.Texture2D.MipLevels = desc.MipLevels;
 
+            NewTex->TexSv = NULL;
             hr = Device->CreateShaderResourceView(NewTex->Tex, NULL, &NewTex->TexSv.GetRawRef());
 
             if (FAILED(hr))
             {
+                OVR_LOG_COM_ERROR(hr);
                 NewTex->Release();
                 return NULL;
             }
@@ -1501,42 +2220,53 @@ Texture* RenderDevice::CreateTexture(int format, int width, int height, const vo
     }
     else
     {
-        DXGI_FORMAT d3dformat;
-        int         bpp;
-        switch(format & Texture_TypeMask)
-        {
-        case Texture_RGBA:
-            bpp = 4;
-            d3dformat = DXGI_FORMAT_R8G8B8A8_UNORM;
-            break;
-        case Texture_R:
-            bpp = 1;
-            d3dformat = DXGI_FORMAT_R8_UNORM;
-            break;
-        case Texture_Depth:
-            bpp = 0;
-            d3dformat = DXGI_FORMAT_D32_FLOAT;
-            break;
-        default:
-            return NULL;
-        }
-
         int samples = (format & Texture_SamplesMask);
         if (samples < 1)
         {
             samples = 1;
         }
 
+        bool createDepthSrv = (format & Texture_SampleDepth) > 0;
+
+        DXGI_FORMAT d3dformat;
+        int         bpp;
+        switch(format & Texture_TypeMask)
+        {
+		case Texture_BGRA:
+			bpp = 4;
+			d3dformat = (format & Texture_SRGB) ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : DXGI_FORMAT_B8G8R8A8_UNORM;
+			break;
+        case Texture_RGBA:
+            bpp = 4;
+			d3dformat = (format & Texture_SRGB) ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+            break;
+        case Texture_R:
+            bpp = 1;
+            d3dformat = DXGI_FORMAT_R8_UNORM;
+            break;
+		case Texture_A:
+			bpp = 1;
+			d3dformat = DXGI_FORMAT_A8_UNORM;
+			break;
+        case Texture_Depth:
+            bpp = 0;
+            d3dformat = createDepthSrv ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_D32_FLOAT;
+            break;
+        default:
+            OVR_ASSERT(false);
+            return NULL;
+        }
+
         Texture* NewTex = new Texture(this, format, width, height);
         NewTex->Samples = samples;
 
         D3D1x_(TEXTURE2D_DESC) dsDesc;
-        dsDesc.Width     = width;
-        dsDesc.Height    = height;
+		dsDesc.Width     = width;
+		dsDesc.Height    = height;
         dsDesc.MipLevels = (format == (Texture_RGBA | Texture_GenMipmaps) && data) ? GetNumMipLevels(width, height) : 1;
         dsDesc.ArraySize = 1;
         dsDesc.Format    = d3dformat;
-        dsDesc.SampleDesc.Count = samples;
+		dsDesc.SampleDesc.Count = samples;
         dsDesc.SampleDesc.Quality = 0;
         dsDesc.Usage     = D3D1x_(USAGE_DEFAULT);
         dsDesc.BindFlags = D3D1x_(BIND_SHADER_RESOURCE);
@@ -1546,9 +2276,8 @@ Texture* RenderDevice::CreateTexture(int format, int width, int height, const vo
         if (format & Texture_RenderTarget)
         {
             if ((format & Texture_TypeMask) == Texture_Depth)
-                // We don't use depth textures, and creating them in d3d10 requires different options.
             {
-                dsDesc.BindFlags = D3D1x_(BIND_DEPTH_STENCIL);
+                dsDesc.BindFlags = createDepthSrv ? (dsDesc.BindFlags | D3D1x_(BIND_DEPTH_STENCIL)) : D3D1x_(BIND_DEPTH_STENCIL);
             }
             else
             {
@@ -1556,16 +2285,40 @@ Texture* RenderDevice::CreateTexture(int format, int width, int height, const vo
             }
         }
 
+        NewTex->Tex = NULL;
         HRESULT hr = Device->CreateTexture2D(&dsDesc, NULL, &NewTex->Tex.GetRawRef());
         if (FAILED(hr))
         {
+            OVR_LOG_COM_ERROR(hr);
             OVR_DEBUG_LOG_TEXT(("Failed to create 2D D3D texture."));
             NewTex->Release();
             return NULL;
         }
         if (dsDesc.BindFlags & D3D1x_(BIND_SHADER_RESOURCE))
         {
-            Device->CreateShaderResourceView(NewTex->Tex, NULL, &NewTex->TexSv.GetRawRef());
+            if((dsDesc.BindFlags & D3D1x_(BIND_DEPTH_STENCIL)) > 0 && createDepthSrv)
+            {
+                D3D1x_(SHADER_RESOURCE_VIEW_DESC) depthSrv;
+                depthSrv.Format = DXGI_FORMAT_R32_FLOAT;
+				depthSrv.ViewDimension = samples > 1 ? D3D1x_(SRV_DIMENSION_TEXTURE2DMS) : D3D1x_(SRV_DIMENSION_TEXTURE2D);
+                depthSrv.Texture2D.MostDetailedMip = 0;
+                depthSrv.Texture2D.MipLevels = dsDesc.MipLevels;
+                NewTex->TexSv = NULL;
+                hr = Device->CreateShaderResourceView(NewTex->Tex, &depthSrv, &NewTex->TexSv.GetRawRef());
+                if (FAILED(hr))
+                {
+                    OVR_LOG_COM_ERROR(hr);
+                }
+            }
+            else
+            {
+                NewTex->TexSv = NULL;
+                hr = Device->CreateShaderResourceView(NewTex->Tex, NULL, &NewTex->TexSv.GetRawRef());
+                if (FAILED(hr))
+                {
+                    OVR_LOG_COM_ERROR(hr);
+                }
+            }
         }
 
         if (data)
@@ -1575,7 +2328,7 @@ Texture* RenderDevice::CreateTexture(int format, int width, int height, const vo
             {
                 int srcw = width, srch = height;
                 int level = 0;
-                UByte* mipmaps = NULL;
+                uint8_t* mipmaps = NULL;
                 do
                 {
                     level++;
@@ -1591,9 +2344,9 @@ Texture* RenderDevice::CreateTexture(int format, int width, int height, const vo
                     }
                     if (mipmaps == NULL)
                     {
-                        mipmaps = (UByte*)OVR_ALLOC(mipw * miph * 4);
+                        mipmaps = (uint8_t*)OVR_ALLOC(mipw * miph * 4);
                     }
-                    FilterRgba2x2(level == 1 ? (const UByte*)data : mipmaps, srcw, srch, mipmaps);
+                    FilterRgba2x2(level == 1 ? (const uint8_t*)data : mipmaps, srcw, srch, mipmaps);
                     Context->UpdateSubresource(NewTex->Tex, level, NULL, mipmaps, mipw * bpp, miph * bpp);
                     srcw = mipw;
                     srch = miph;
@@ -1611,11 +2364,26 @@ Texture* RenderDevice::CreateTexture(int format, int width, int height, const vo
         {
             if ((format & Texture_TypeMask) == Texture_Depth)
             {
-                Device->CreateDepthStencilView(NewTex->Tex, NULL, &NewTex->TexDsv.GetRawRef());
+                D3D1x_(DEPTH_STENCIL_VIEW_DESC) depthDsv;
+                ZeroMemory(&depthDsv, sizeof(depthDsv));
+                depthDsv.Format = DXGI_FORMAT_D32_FLOAT;
+                depthDsv.ViewDimension = samples > 1 ? D3D1x_(DSV_DIMENSION_TEXTURE2DMS) : D3D1x_(DSV_DIMENSION_TEXTURE2D);
+                depthDsv.Texture2D.MipSlice = 0;
+                NewTex->TexDsv = NULL;
+                hr = Device->CreateDepthStencilView(NewTex->Tex, createDepthSrv ? &depthDsv : NULL, &NewTex->TexDsv.GetRawRef());
+                if (FAILED(hr))
+                {
+                    OVR_LOG_COM_ERROR(hr);
+                }
             }
             else
             {
-                Device->CreateRenderTargetView(NewTex->Tex, NULL, &NewTex->TexRtv.GetRawRef());
+                NewTex->TexRtv = NULL;
+                hr = Device->CreateRenderTargetView(NewTex->Tex, NULL, &NewTex->TexRtv.GetRawRef());
+                if (FAILED(hr))
+                {
+                    OVR_LOG_COM_ERROR(hr);
+                }
             }
         }
 
@@ -1624,6 +2392,13 @@ Texture* RenderDevice::CreateTexture(int format, int width, int height, const vo
 }
 
 // Rendering
+
+void RenderDevice::ResolveMsaa(OVR::Render::Texture* msaaTex, OVR::Render::Texture* outputTex)
+{
+    int isSrgb = ((Texture*)msaaTex)->Format & Texture_SRGB;
+
+    Context->ResolveSubresource(((Texture*)outputTex)->Tex, 0, ((Texture*)msaaTex)->Tex, 0, isSrgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM);
+}
 
 void RenderDevice::BeginRendering()
 {
@@ -1665,7 +2440,6 @@ void RenderDevice::SetRenderTarget(Render::Texture* color, Render::Texture* dept
     Context->OMSetRenderTargets(1, &((Texture*)color)->TexRtv.GetRawRef(), ((Texture*)depth)->TexDsv);
 }
 
-
 void RenderDevice::SetWorldUniforms(const Matrix4f& proj)
 {
     StdUniforms.Proj = proj.Transposed();
@@ -1679,13 +2453,19 @@ void RenderDevice::Render(const Matrix4f& matrix, Model* model)
     if (!model->VertexBuffer)
     {
         Ptr<Buffer> vb = *CreateBuffer();
-        vb->Data(Buffer_Vertex, &model->Vertices[0], model->Vertices.GetSize() * sizeof(Vertex));
+        if (!vb->Data(Buffer_Vertex | Buffer_ReadOnly, &model->Vertices[0], model->Vertices.GetSize() * sizeof(Vertex)))
+        {
+            OVR_ASSERT(false);
+        }
         model->VertexBuffer = vb;
     }
     if (!model->IndexBuffer)
     {
         Ptr<Buffer> ib = *CreateBuffer();
-        ib->Data(Buffer_Index, &model->Indices[0], model->Indices.GetSize() * 2);
+        if (!ib->Data(Buffer_Index | Buffer_ReadOnly, &model->Indices[0], model->Indices.GetSize() * 2))
+        {
+            OVR_ASSERT(false);
+        }
         model->IndexBuffer = ib;
     }
 
@@ -1703,38 +2483,64 @@ void RenderDevice::RenderWithAlpha(	const Fill* fill, Render::Buffer* vertices, 
 }
 
 void RenderDevice::Render(const Fill* fill, Render::Buffer* vertices, Render::Buffer* indices,
-                          const Matrix4f& matrix, int offset, int count, PrimitiveType rprim)
+                          const Matrix4f& matrix, int offset, int count, PrimitiveType rprim, MeshType meshType/* = Mesh_Scene*/)
 {
-    Context->IASetInputLayout(ModelVertexIL);
+    ID3D1xBuffer* vertexBuffer = ((Buffer*)vertices)->GetBuffer();
+    UINT vertexOffset = offset;
+    UINT vertexStride = sizeof(Vertex);
+    switch(meshType)
+    {
+    case Mesh_Scene:
+        Context->IASetInputLayout(ModelVertexIL);
+        vertexStride = sizeof(Vertex);
+        break;
+    case Mesh_Distortion:
+        Context->IASetInputLayout(DistortionVertexIL);
+        vertexStride = sizeof(DistortionVertex);
+        break;
+    case Mesh_Heightmap:
+        Context->IASetInputLayout(HeightmapVertexIL);
+        vertexStride = sizeof(HeightmapVertex);
+        break;
+    default: OVR_ASSERT(false);
+    }
+
+    Context->IASetVertexBuffers(0, 1, &vertexBuffer, &vertexStride, &vertexOffset);
+
     if (indices)
     {
         Context->IASetIndexBuffer(((Buffer*)indices)->GetBuffer(), DXGI_FORMAT_R16_UINT, 0);
     }
 
-    ID3D1xBuffer* vertexBuffer = ((Buffer*)vertices)->GetBuffer();
-    UINT vertexStride = sizeof(Vertex);
-    UINT vertexOffset = offset;
-    Context->IASetVertexBuffers(0, 1, &vertexBuffer, &vertexStride, &vertexOffset);
-
     ShaderSet* shaders = ((ShaderFill*)fill)->GetShaders();
 
     ShaderBase* vshader = ((ShaderBase*)shaders->GetShader(Shader_Vertex));
     unsigned char* vertexData = vshader->UniformData;
-    if (vertexData)
+    if ( vertexData != NULL )
     {
-        StandardUniformData* stdUniforms = (StandardUniformData*) vertexData;
-        stdUniforms->View = matrix.Transposed();
-        stdUniforms->Proj = StdUniforms.Proj;
-        UniformBuffers[Shader_Vertex]->Data(Buffer_Uniform, vertexData, vshader->UniformsSize);
+        // TODO: some VSes don't start with StandardUniformData!
+        if ( vshader->UniformsSize >= sizeof(StandardUniformData) )
+        {
+            StandardUniformData* stdUniforms = (StandardUniformData*) vertexData;
+            stdUniforms->View = matrix.Transposed();
+            stdUniforms->Proj = StdUniforms.Proj;
+        }
+
+        if (!UniformBuffers[Shader_Vertex]->Data(Buffer_Uniform, vertexData, vshader->UniformsSize))
+        {
+            OVR_ASSERT(false);
+        }
         vshader->SetUniformBuffer(UniformBuffers[Shader_Vertex]);
     }
 
     for(int i = Shader_Vertex + 1; i < Shader_Count; i++)
+    {
         if (shaders->GetShader(i))
         {
             ((ShaderBase*)shaders->GetShader(i))->UpdateBuffer(UniformBuffers[i]);
             ((ShaderBase*)shaders->GetShader(i))->SetUniformBuffer(UniformBuffers[i]);
         }
+    }
 
     D3D1x_(PRIMITIVE_TOPOLOGY) prim;
     switch(rprim)
@@ -1749,7 +2555,7 @@ void RenderDevice::Render(const Fill* fill, Render::Buffer* vertices, Render::Bu
         prim = D3D1x_(PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
         break;
     default:
-        assert(0);
+        OVR_ASSERT(0);
         return;
     }
     Context->IASetPrimitiveTopology(prim);
@@ -1770,32 +2576,80 @@ void RenderDevice::Render(const Fill* fill, Render::Buffer* vertices, Render::Bu
     }
 }
 
-UPInt RenderDevice::QueryGPUMemorySize()
+size_t RenderDevice::QueryGPUMemorySize()
 {
 	IDXGIDevice* pDXGIDevice;
-	Device->QueryInterface(__uuidof(IDXGIDevice), (void **)&pDXGIDevice);
+	HRESULT hr = Device->QueryInterface(__uuidof(IDXGIDevice), (void **)&pDXGIDevice);
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
+    }
 	IDXGIAdapter * pDXGIAdapter;
-	pDXGIDevice->GetAdapter(&pDXGIAdapter);
-	DXGI_ADAPTER_DESC adapterDesc;
-	pDXGIAdapter->GetDesc(&adapterDesc);
-	return adapterDesc.DedicatedVideoMemory;
+	hr = pDXGIDevice->GetAdapter(&pDXGIAdapter);
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
+    }
+    DXGI_ADAPTER_DESC adapterDesc;
+	hr = pDXGIAdapter->GetDesc(&adapterDesc);
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
+    }
+
+	pDXGIAdapter->Release();
+	pDXGIDevice->Release();
+    return adapterDesc.DedicatedVideoMemory;
 }
 
 
-void RenderDevice::Present()
+void RenderDevice::Present ( bool withVsync )
 {
-    SwapChain->Present(0, 0);
+	for( int i = 0; i < 4; ++i )
+	{
+		if( OVR::Util::ImageWindow::GlobalWindow( i ) )
+		{
+			OVR::Util::ImageWindow::GlobalWindow( i )->Process();
+		}
+	}
+
+    HRESULT hr;
+    if ( withVsync )
+    {
+        hr = SwapChain->Present(1, 0);
+    }
+    else
+    {
+        // Immediate present
+        hr = SwapChain->Present(0, 0);
+    }
+    if (FAILED(hr))
+    {
+        OVR_LOG_COM_ERROR(hr);
+    }
 }
 
-void RenderDevice::ForceFlushGPU()
+void RenderDevice::Flush()
 {
+    Context->Flush();
+}
+
+void RenderDevice::WaitUntilGpuIdle()
+{
+#if 0
+	// If enabling this option and using an NVIDIA GPU,
+	// then make sure your "max pre-rendered frames" is set to 1 under the NVIDIA GPU settings.
+
+	// Flush GPU data and don't stall CPU waiting for GPU to complete
+	Context->Flush();
+#else
+	// Flush and Stall CPU while waiting for GPU to complete rendering all of the queued draw calls
     D3D1x_QUERY_DESC queryDesc = { D3D1x_(QUERY_EVENT), 0 };
     Ptr<ID3D1xQuery> query;
     BOOL             done = FALSE;
 
     if (Device->CreateQuery(&queryDesc, &query.GetRawRef()) == S_OK)
     {
-
 #if (OVR_D3D_VERSION == 10)
         // Begin() not used for EVENT query.
         query->End();
@@ -1808,37 +2662,59 @@ void RenderDevice::ForceFlushGPU()
         do { }
         while(!done && !FAILED(Context->GetData(query, &done, sizeof(BOOL), 0)));
 #endif
-
     }
+
+#endif
 }
 
-
-void RenderDevice::FillRect(float left, float top, float right, float bottom, Color c)
+void RenderDevice::FillRect(float left, float top, float right, float bottom, Color c, const Matrix4f* view)
 {
     Context->OMSetBlendState(BlendState, NULL, 0xffffffff);
-    OVR::Render::RenderDevice::FillRect(left, top, right, bottom, c);
+    OVR::Render::RenderDevice::FillRect(left, top, right, bottom, c, view);
     Context->OMSetBlendState(NULL, NULL, 0xffffffff);
 }
 
-void RenderDevice::FillGradientRect(float left, float top, float right, float bottom, Color col_top, Color col_btm)
+void RenderDevice::FillGradientRect(float left, float top, float right, float bottom, Color col_top, Color col_btm, const Matrix4f* view)
 {
     Context->OMSetBlendState(BlendState, NULL, 0xffffffff);
-    OVR::Render::RenderDevice::FillGradientRect(left, top, right, bottom, col_top, col_btm);
+    OVR::Render::RenderDevice::FillGradientRect(left, top, right, bottom, col_top, col_btm, view);
     Context->OMSetBlendState(NULL, NULL, 0xffffffff);
 }
 
-void RenderDevice::RenderText(const struct Font* font, const char* str, float x, float y, float size, Color c)
+void RenderDevice::RenderText(const struct Font* font, const char* str, float x, float y, float size, Color c, const Matrix4f* view)
 {
 	Context->OMSetBlendState(BlendState, NULL, 0xffffffff);
-	OVR::Render::RenderDevice::RenderText(font, str, x, y, size, c);
+	OVR::Render::RenderDevice::RenderText(font, str, x, y, size, c, view);
 	Context->OMSetBlendState(NULL, NULL, 0xffffffff);
 }
 
-void RenderDevice::RenderImage(float left, float top, float right, float bottom, ShaderFill* image)
+void RenderDevice::RenderImage(float left, float top, float right, float bottom, ShaderFill* image, unsigned char alpha, const Matrix4f* view)
 {
     Context->OMSetBlendState(BlendState, NULL, 0xffffffff);
-    OVR::Render::RenderDevice::RenderImage(left, top, right, bottom, image);
+    OVR::Render::RenderDevice::RenderImage(left, top, right, bottom, image, alpha, view);
     Context->OMSetBlendState(NULL, NULL, 0xffffffff);
+}
+
+void RenderDevice::BeginGpuEvent(const char* markerText, uint32_t markerColor)
+{
+#if GPU_PROFILING
+    WCHAR wStr[255];
+    size_t newStrLen = 0;
+    mbstowcs_s(&newStrLen, wStr, markerText, 255);
+    LPCWSTR pwStr = wStr;
+
+    D3DPERF_BeginEvent(markerColor, pwStr);
+#else
+    OVR_UNUSED(markerText);
+    OVR_UNUSED(markerColor);
+#endif
+}
+
+void RenderDevice::EndGpuEvent()
+{
+#if GPU_PROFILING
+    D3DPERF_EndEvent();
+#endif
 }
 
 }}}
